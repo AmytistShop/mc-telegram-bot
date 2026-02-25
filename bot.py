@@ -15,7 +15,7 @@ from aiogram.fsm.context import FSMContext
 
 import os
 print("ENV TOKEN present:", "TOKEN" in os.environ)
-TOKEN = os.environ.get("8563240122:AAGVS5stAmmC3LuhfueDeUar8nLarIForAw")
+TOKEN = os.environ.get("TOKEN")
 print("ENV TOKEN length:", 0 if TOKEN is None else len(TOKEN))
 if not TOKEN:
     raise RuntimeError("TOKEN is not set. Add environment variable TOKEN.")
