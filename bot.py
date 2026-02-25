@@ -1,7 +1,10 @@
 import os
 import re
 import sqlite3
+import asyncio
 from datetime import datetime, timedelta, timezone
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
@@ -13,15 +16,13 @@ from aiogram.types import (
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
-import os
-print("ENV TOKEN present:", "TOKEN" in os.environ)
-TOKEN = os.environ.get("TOKEN")
-print("ENV TOKEN length:", 0 if TOKEN is None else len(TOKEN))
-if not TOKEN:
-    raise RuntimeError("TOKEN is not set. Add environment variable TOKEN.")
+
 # =========================
 # НАСТРОЙКИ (Render: Environment Variables)
 # =========================
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN is not set. Add environment variable TOKEN in Render.")
 
 ADMIN_IDS = {6911558950, 8085895186}  # доступ к ЛС меню и командам управления
 DB_PATH = "mc_bot.db"
@@ -34,19 +35,39 @@ PAGE_SIZE = 10
 
 
 # =========================
+# UPTIMEROBOT / HEALTHCHECK (чтобы Render не "спал")
+# =========================
+async def health(request):
+    return web.Response(text="OK")
+
+async def start_web_server():
+    """
+    Render Web Service ожидает открытый порт.
+    Мы открываем GET / -> OK, чтобы UptimeRobot мог пинговать.
+    """
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    port = int(os.getenv("PORT", "10000"))  # Render выдаёт PORT
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"Health server started on 0.0.0.0:{port}")
+
+
+# =========================
 # УТИЛИТЫ
 # =========================
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def now_ts() -> int:
     return int(now_utc().timestamp())
-
 
 def fmt_dt(ts: int | None) -> str:
     if ts is None:
@@ -54,12 +75,10 @@ def fmt_dt(ts: int | None) -> str:
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
     return dt.strftime("%d.%m.%Y %H:%M")
 
-
 def active_tag(ts: int | None) -> str:
     if ts is None:
         return "[Активно]"
     return "[Активно]" if ts > now_ts() else "[Неактивно]"
-
 
 def parse_duration(token: str | None) -> int | None:
     """
@@ -77,10 +96,8 @@ def parse_duration(token: str | None) -> int | None:
     mult = {"m": 60, "h": 3600, "d": 86400}[unit]
     return n * mult
 
-
 def normalize_text(t: str) -> str:
     return (t or "").strip()
-
 
 def safe_cut(s: str, limit: int = 800) -> str:
     s = s or ""
@@ -102,10 +119,8 @@ KW_RE = re.compile("|".join(KW_PATTERNS), re.IGNORECASE)
 TG_LINK_RE = re.compile(r"(https?://)?(t\.me|telegram\.me)/[A-Za-z0-9_]{3,}", re.IGNORECASE)
 PHONE_RE = re.compile(r"(?<!\w)(\+?\d[\d\-\s\(\)]{8,}\d)(?!\w)")
 
-
 def hashtag_at_end(text: str) -> bool:
     return bool(re.search(r"#реклама\s*$", (text or "").lower()))
-
 
 def detect_ad_reason(text: str) -> tuple[bool, str, str]:
     """
@@ -208,7 +223,6 @@ def upsert_chat(chat_id: int, title: str | None):
     con.commit()
     con.close()
 
-
 def list_known_chats() -> list[tuple[int, str]]:
     con = db()
     rows = con.execute(
@@ -216,7 +230,6 @@ def list_known_chats() -> list[tuple[int, str]]:
     ).fetchall()
     con.close()
     return [(int(r[0]), str(r[1])) for r in rows]
-
 
 def permit_active(chat_id: int, user_id: int) -> tuple[bool, int | None]:
     con = db()
@@ -232,7 +245,6 @@ def permit_active(chat_id: int, user_id: int) -> tuple[bool, int | None]:
         return True, None
     return (exp > now_ts()), exp
 
-
 def permit_set(chat_id: int, user_id: int, username: str | None, full_name: str | None,
                duration_seconds: int | None, issued_by: int):
     con = db()
@@ -246,7 +258,6 @@ def permit_set(chat_id: int, user_id: int, username: str | None, full_name: str 
     con.commit()
     con.close()
 
-
 def permit_remove(chat_id: int, user_id: int) -> bool:
     con = db()
     cur = con.execute("DELETE FROM permits WHERE chat_id=? AND user_id=?", (chat_id, user_id))
@@ -254,7 +265,6 @@ def permit_remove(chat_id: int, user_id: int) -> bool:
     ok = cur.rowcount > 0
     con.close()
     return ok
-
 
 def list_permits_all(chat_id: int, page: int, page_size: int = PAGE_SIZE):
     offset = (page - 1) * page_size
@@ -280,7 +290,6 @@ def list_permits_all(chat_id: int, page: int, page_size: int = PAGE_SIZE):
     con.close()
     return rows, total
 
-
 def strike_inc(chat_id: int, user_id: int) -> int:
     con = db()
     ts = now_ts()
@@ -305,13 +314,11 @@ def strike_inc(chat_id: int, user_id: int) -> int:
     con.close()
     return new
 
-
 def strike_reset(chat_id: int, user_id: int):
     con = db()
     con.execute("DELETE FROM ad_strikes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
     con.commit()
     con.close()
-
 
 def log_deletion(chat_id: int, user, text: str, reason_type: str, reason_value: str):
     con = db()
@@ -331,7 +338,6 @@ def log_deletion(chat_id: int, user, text: str, reason_type: str, reason_value: 
     )
     con.commit()
     con.close()
-
 
 def add_mc_action(chat_id: int, target_user_id: int, target_username: str | None, target_full_name: str,
                   action_type: str, issued_by: int, expires_at: int | None, reason: str | None):
@@ -355,7 +361,6 @@ def add_mc_action(chat_id: int, target_user_id: int, target_username: str | None
     con.commit()
     con.close()
 
-
 def list_mc_actions(chat_id: int, page: int, page_size: int = PAGE_SIZE):
     offset = (page - 1) * page_size
     con = db()
@@ -371,7 +376,6 @@ def list_mc_actions(chat_id: int, page: int, page_size: int = PAGE_SIZE):
     con.close()
     return rows, total
 
-
 def list_log_chats():
     con = db()
     rows = con.execute(
@@ -382,7 +386,6 @@ def list_log_chats():
     ).fetchall()
     con.close()
     return [(int(r[0]), str(r[1])) for r in rows]
-
 
 def list_delete_logs(chat_id: int, page: int, page_size: int = PAGE_SIZE):
     offset = (page - 1) * page_size
@@ -421,19 +424,16 @@ def kb_dm_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📜 Логи", callback_data="dm:logs")],
     ])
 
-
 def kb_dm_back(cb: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=cb)]
     ])
-
 
 def kb_dm_profile() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📊 Статистика", callback_data="dm:stats:chats")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="dm:home")],
     ])
-
 
 def kb_dm_perm() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -442,14 +442,12 @@ def kb_dm_perm() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="dm:home")],
     ])
 
-
 def kb_dm_chats(prefix: str, chats: list[tuple[int, str]], back_cb: str) -> InlineKeyboardMarkup:
     kb = []
     for chat_id, title in chats[:25]:
         kb.append([InlineKeyboardButton(text=title, callback_data=f"{prefix}:{chat_id}")])
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
     return InlineKeyboardMarkup(inline_keyboard=kb)
-
 
 def kb_dm_logs_chats(chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     kb = []
@@ -458,9 +456,7 @@ def kb_dm_logs_chats(chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="dm:home")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
 def kb_duration_picker(chat_id: int, user_id: int, back_key: str) -> InlineKeyboardMarkup:
-    # back_key: 'perm' or 'home'
     btns = [
         ("15m", 15 * 60),
         ("1h", 60 * 60),
@@ -485,7 +481,6 @@ def kb_duration_picker(chat_id: int, user_id: int, back_key: str) -> InlineKeybo
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-
 def kb_stats_pager(chat_id: int, page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
     row = []
     if has_prev:
@@ -501,7 +496,6 @@ def kb_stats_pager(chat_id: int, page: int, has_prev: bool, has_next: bool) -> I
     kb.append([InlineKeyboardButton(text="🏠 Меню", callback_data="dm:home")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
 def kb_logs_pager(chat_id: int, page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
     row = []
     if has_prev:
@@ -515,10 +509,6 @@ def kb_logs_pager(chat_id: int, page: int, has_prev: bool, has_next: bool) -> In
     kb.append([InlineKeyboardButton(text="🏠 Меню", callback_data="dm:home")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-
-# =========================
-# КЛАВИАТУРА /mclist
-# =========================
 def kb_mclist_pager(page: int, has_prev: bool, has_next: bool) -> InlineKeyboardMarkup:
     row = []
     if has_prev:
@@ -560,7 +550,6 @@ async def dm_home(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("Меню:", reply_markup=kb_dm_main())
     await cq.answer()
 
-
 @dp.callback_query(F.data == "dm:profile")
 async def dm_profile(cq: CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -575,7 +564,6 @@ async def dm_profile(cq: CallbackQuery):
     await cq.message.edit_text(text, reply_markup=kb_dm_profile())
     await cq.answer()
 
-
 @dp.callback_query(F.data == "dm:perm")
 async def dm_perm(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
@@ -584,19 +572,13 @@ async def dm_perm(cq: CallbackQuery, state: FSMContext):
     await cq.message.edit_text("✅ Разрешения\nВыберите действие:", reply_markup=kb_dm_perm())
     await cq.answer()
 
-
 @dp.callback_query(F.data == "dm:vip")
 async def dm_vip(cq: CallbackQuery):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Нет доступа", show_alert=True)
 
     await cq.message.edit_text(
-        "💎 VIP подписка\n\n"
-        "Пока заглушка.\n"
-        "Идеи:\n"
-        "• расширенные лимиты рекламы\n"
-        "• мягче фильтр\n"
-        "• бейдж\n",
+        "💎 VIP подписка\n\nПока заглушка.",
         reply_markup=kb_dm_back("dm:home")
     )
     await cq.answer()
@@ -618,7 +600,6 @@ async def dm_logs_choose_chat(cq: CallbackQuery):
 
     await cq.message.edit_text("📜 Логи — выберите чат:", reply_markup=kb_dm_logs_chats(chats))
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("dm:logchat:"))
 async def dm_logs_show(cq: CallbackQuery):
@@ -680,7 +661,6 @@ async def dm_stats_chats(cq: CallbackQuery):
     await cq.message.edit_text("📊 Статистика — выберите чат:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await cq.answer()
 
-
 @dp.callback_query(F.data.startswith("dm:stats:chat:"))
 async def dm_stats_chat_page(cq: CallbackQuery):
     if not is_admin(cq.from_user.id):
@@ -738,7 +718,6 @@ async def dm_perm_give_choose_chat(cq: CallbackQuery, state: FSMContext):
     )
     await cq.answer()
 
-
 @dp.callback_query(F.data == "dm:perm:remove:chats")
 async def dm_perm_remove_choose_chat(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
@@ -757,7 +736,6 @@ async def dm_perm_remove_choose_chat(cq: CallbackQuery, state: FSMContext):
     )
     await cq.answer()
 
-
 @dp.callback_query(F.data.startswith("dm:perm:givechat:"))
 async def dm_perm_give_chat_selected(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
@@ -768,13 +746,11 @@ async def dm_perm_give_chat_selected(cq: CallbackQuery, state: FSMContext):
     await state.set_state(DmPermFSM.waiting_user_for_grant)
 
     await cq.message.edit_text(
-        "Отправьте ID пользователя (число) ИЛИ перешлите сообщение пользователя.\n\n"
-        "Пример: `123456789`",
+        "Отправьте ID пользователя (число) ИЛИ перешлите сообщение пользователя.\n\nПример: `123456789`",
         reply_markup=kb_dm_back("dm:perm"),
         parse_mode="Markdown"
     )
     await cq.answer()
-
 
 @dp.callback_query(F.data.startswith("dm:perm:removechat:"))
 async def dm_perm_remove_chat_selected(cq: CallbackQuery, state: FSMContext):
@@ -791,14 +767,12 @@ async def dm_perm_remove_chat_selected(cq: CallbackQuery, state: FSMContext):
     )
     await cq.answer()
 
-
 def extract_user_id_from_forward(msg: Message) -> int | None:
     if msg.forward_from:
         return msg.forward_from.id
     if msg.reply_to_message and msg.reply_to_message.forward_from:
         return msg.reply_to_message.forward_from.id
     return None
-
 
 @dp.message(DmPermFSM.waiting_user_for_grant)
 async def dm_perm_wait_user_grant(msg: Message, state: FSMContext):
@@ -821,14 +795,17 @@ async def dm_perm_wait_user_grant(msg: Message, state: FSMContext):
         user_id = extract_user_id_from_forward(msg)
 
     if user_id is None:
-        return await msg.answer("Не смог определить пользователя. Пришлите ID (число) или перешлите сообщение с автором.")
+        return await msg.answer(
+            "Не смог определить пользователя по пересылке.\n"
+            "⚠️ Такое бывает, если у сообщения скрыт автор.\n\n"
+            "Пришлите ID (число)."
+        )
 
     await state.clear()
     await msg.answer(
         f"Пользователь ID: {user_id}\nВыберите срок:",
         reply_markup=kb_duration_picker(chat_id, user_id, "perm")
     )
-
 
 @dp.message(DmPermFSM.waiting_user_for_remove)
 async def dm_perm_wait_user_remove(msg: Message, state: FSMContext):
@@ -851,7 +828,7 @@ async def dm_perm_wait_user_remove(msg: Message, state: FSMContext):
         user_id = extract_user_id_from_forward(msg)
 
     if user_id is None:
-        return await msg.answer("Не смог определить пользователя. Пришлите ID (число) или перешлите сообщение с автором.")
+        return await msg.answer("Не смог определить пользователя. Пришлите ID (число).")
 
     ok = permit_remove(chat_id, user_id)
     await state.clear()
@@ -860,13 +837,11 @@ async def dm_perm_wait_user_remove(msg: Message, state: FSMContext):
         reply_markup=kb_dm_main()
     )
 
-
 @dp.callback_query(F.data.startswith("dm:dur2:"))
 async def dm_duration_selected(cq: CallbackQuery):
     if not is_admin(cq.from_user.id):
         return await cq.answer("Нет доступа", show_alert=True)
 
-    # dm:dur2:<chat_id>:<user_id>:<seconds>:<back_key>
     parts = cq.data.split(":")
     chat_id = int(parts[2])
     user_id = int(parts[3])
@@ -927,7 +902,6 @@ async def mclist_cmd(msg: Message):
     has_prev = page > 1
     has_next = total > page * PAGE_SIZE
     await msg.reply("\n".join(lines)[:3900], reply_markup=kb_mclist_pager(page, has_prev, has_next))
-
 
 @dp.callback_query(F.data.startswith("mclist:"))
 async def mclist_pager_cb(cq: CallbackQuery):
@@ -992,10 +966,8 @@ async def resolve_target(msg: Message, args: list[str]) -> tuple[int | None, str
         return None, args[0].lstrip("@").lower(), None, args[1:]
     return None, None, None, args
 
-
 def split_reason(tokens: list[str]) -> str:
     return " ".join(tokens).strip() if tokens else "не указана"
-
 
 async def ensure_group(msg: Message) -> bool:
     if msg.chat.type not in ("group", "supergroup"):
@@ -1027,7 +999,6 @@ async def mcwarn(msg: Message):
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"⚠️ Выдано предупреждение: {who}\nПричина: {reason}")
 
-
 @dp.message(Command("mcunwarn"))
 async def mcunwarn(msg: Message):
     if not await ensure_group(msg):
@@ -1047,7 +1018,6 @@ async def mcunwarn(msg: Message):
 
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"✅ Сброс предупреждений: {who}\nПричина: {reason}")
-
 
 @dp.message(Command("mcmute"))
 async def mcmute(msg: Message):
@@ -1091,7 +1061,6 @@ async def mcmute(msg: Message):
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"🔇 Мут выдан: {who}\nДо: {fmt_dt(expires_at)} {active_tag(expires_at)}\nПричина: {reason}")
 
-
 @dp.message(Command("mcunmute"))
 async def mcunmute(msg: Message):
     if not await ensure_group(msg):
@@ -1121,7 +1090,6 @@ async def mcunmute(msg: Message):
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"✅ Мут снят: {who}\nПричина: {reason}")
 
-
 @dp.message(Command("mckick"))
 async def mckick(msg: Message):
     if not await ensure_group(msg):
@@ -1147,7 +1115,6 @@ async def mckick(msg: Message):
 
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"👢 Кик: {who}\nПричина: {reason}")
-
 
 @dp.message(Command("mcban"))
 async def mcban(msg: Message):
@@ -1187,7 +1154,6 @@ async def mcban(msg: Message):
 
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"⛔ Бан: {who}\nДо: {fmt_dt(expires_at)} {active_tag(expires_at)}\nПричина: {reason}")
-
 
 @dp.message(Command("mcunban"))
 async def mcunban(msg: Message):
@@ -1240,7 +1206,6 @@ async def adgive(msg: Message):
 
     who = f"@{target_uname}" if target_uname else (target_name or str(target_id))
     await msg.reply(f"✅ Разрешение на рекламу выдано: {who}\nДо: {fmt_dt(exp)} {active_tag(exp)}")
-
 
 @dp.message(Command("adremove"))
 async def adremove(msg: Message):
@@ -1357,9 +1322,9 @@ async def auto_moderation(msg: Message):
 # =========================
 async def main():
     db().close()
+    # ВАЖНО: сначала поднимаем веб-порт, потом polling
+    await start_web_server()
     await dp.start_polling(bot)
 
-
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
