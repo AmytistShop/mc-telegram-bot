@@ -15,16 +15,13 @@ from aiogram.fsm.context import FSMContext
 
 import os
 print("ENV TOKEN present:", "TOKEN" in os.environ)
-TOKEN = os.environ.get("TOKEN")
+TOKEN = os.environ.get("8563240122:AAGVS5stAmmC3LuhfueDeUar8nLarIForAw")
 print("ENV TOKEN length:", 0 if TOKEN is None else len(TOKEN))
 if not TOKEN:
     raise RuntimeError("TOKEN is not set. Add environment variable TOKEN.")
 # =========================
 # НАСТРОЙКИ (Render: Environment Variables)
 # =========================
-TOKEN = os.getenv("8563240122:AAGVS5stAmmC3LuhfueDeUar8nLarIForAw")  # <-- Render/Windows ENV
-if not TOKEN:
-    raise RuntimeError("TOKEN is not set. Add environment variable TOKEN.")
 
 ADMIN_IDS = {6911558950, 8085895186}  # доступ к ЛС меню и командам управления
 DB_PATH = "mc_bot.db"
