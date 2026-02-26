@@ -2,6 +2,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from html import escape
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -107,6 +108,17 @@ def hashtag_at_end(text: str) -> bool:
 def has_hashtag(text: str) -> bool:
     return HASHTAG in (text or "").lower()
 
+def user_link(uid: int, name: str | None) -> str:
+    safe_name = escape(name or str(uid))
+    return f'<a href="tg://user?id={uid}">{safe_name}</a>'
+
+def fmt_left(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h:02d}:{m:02d}"
+
 
 # =========================
 # АНТИ-РЕКЛАМА (правила)
@@ -121,8 +133,6 @@ def is_ad_message(text: str | None) -> tuple[bool, str]:
     @username НЕ считается рекламой.
     """
     t = (text or "").lower()
-
-    # НЕ ищем @username
     if TELEGRAM_LINK.search(t):
         return True, "ссылка t.me"
     if PHONE.search(t):
@@ -419,7 +429,6 @@ dp = Dispatcher()
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
     flag = is_admin(msg.from_user.id)
-    # В ГЛАВНОМ МЕНЮ УБРАЛ "Правила..."
     await msg.answer(
         "🏠 <b>Главное меню</b>\n\n"
         f"📌 Тег рекламы в конце: <code>{HASHTAG}</code>",
@@ -437,6 +446,20 @@ async def cmd_chatid(msg: Message):
         await msg.reply(f"✅ chat_id: <code>{msg.chat.id}</code>")
     else:
         await msg.answer("ℹ️ <b>/chatid</b> работает только в группе.")
+
+
+# =========================
+# /userid (только админы, только reply)
+# =========================
+@dp.message(F.chat.type.in_({"group", "supergroup"}), Command("userid"))
+async def cmd_userid(msg: Message):
+    remember_chat(msg.chat.id, msg.chat.title)
+    if not is_admin(msg.from_user.id):
+        return
+    if not msg.reply_to_message or not msg.reply_to_message.from_user:
+        return await msg.reply("ℹ️ Используй <b>/userid</b> <u>ответом</u> на сообщение пользователя.")
+    u = msg.reply_to_message.from_user
+    await msg.reply(f"🆔 {user_link(u.id, u.full_name)}: <code>{u.id}</code>")
 
 
 # =========================
@@ -806,7 +829,7 @@ async def cmd_mclist(msg: Message):
             text += (
                 f"• <b>{u}</b> — <code>{kind}</code>\n"
                 f"  ⏳ До: <b>{fmt_dt(until_ts)}</b> {st}\n"
-                f"  🧾 Причина: <i>{reason or 'причина не указана'}</i>\n"
+                f"  🧾 Причина: <i>{escape(reason or 'причина не указана')}</i>\n"
                 f"  🕒 Выдано: {fmt_dt(int(issued_ts))}\n\n"
             )
 
@@ -820,7 +843,6 @@ async def cmd_mclist(msg: Message):
 
 # =========================
 # ГРУППА: ТОЛЬКО MC-КОМАНДЫ НАКАЗАНИЙ
-# (УБРАНЫ /ban /mute /warn /kick И УБРАН /mcunlock)
 # =========================
 HELP_FORMS = {
     "mcwarn":   "Форма: <code>/mcwarn @user причина</code> или ответом: <code>/mcwarn причина</code>",
@@ -832,8 +854,6 @@ HELP_FORMS = {
     "mcunban":  "Форма: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>",
 }
 
-# ВАЖНО: этот хендлер ловит ТОЛЬКО /mc... команды,
-# чтобы антиреклама работала на обычных сообщениях.
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.text.startswith("/mc"))
 async def mc_commands_router(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
@@ -844,15 +864,13 @@ async def mc_commands_router(msg: Message):
 
     cmd = parts[0].lstrip("/").split("@")[0].lower()
 
-    # только эти команды
     CMDS = {"mcwarn", "mcmute", "mcban", "mckick", "mcunwarn", "mcunmute", "mcunban"}
     if cmd not in CMDS:
-        return  # неизвестная /mc команда — игнор
+        return
 
     if not is_admin(msg.from_user.id):
         return
 
-    # подсказка без аргументов (кроме reply)
     if cmd in HELP_FORMS and len(parts) == 1 and not msg.reply_to_message:
         return await msg.reply(HELP_FORMS[cmd])
 
@@ -860,7 +878,13 @@ async def mc_commands_router(msg: Message):
     if target is None:
         return await msg.reply("❌ Не смог определить пользователя. Ответь на сообщение или укажи @user/ID.")
 
-    t_uname = msg.reply_to_message.from_user.username if msg.reply_to_message else None
+    target_name = None
+    t_uname = None
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_name = msg.reply_to_message.from_user.full_name
+        t_uname = msg.reply_to_message.from_user.username
+
+    t_link = user_link(target, target_name or str(target))
     reason = "причина не указана"
     dur_sec = None
 
@@ -874,7 +898,7 @@ async def mc_commands_router(msg: Message):
         admin_warn_set(msg.chat.id, target, cnt)
 
         mc_upsert(msg.chat.id, target, t_uname, "warn", None, reason, msg.from_user.id, 1)
-        await msg.reply(f"⚠️ Предупреждение <b>{cnt}/3</b>\nПричина: <i>{reason}</i>")
+        await msg.reply(f"⚠️ {t_link} получает предупреждение <b>{cnt}/3</b>\nПричина: <i>{escape(reason)}</i>")
 
         if cnt >= ADMIN_WARN_LIMIT:
             await apply_ban(msg.chat.id, target, ADMIN_WARN_AUTOBAN_SECONDS)
@@ -885,11 +909,10 @@ async def mc_commands_router(msg: Message):
                 "автобан за 4/3 предупреждений",
                 msg.from_user.id, 1
             )
-            await msg.reply("⛔ Лимит 4/3 — выдан бан на 3 дня. Счётчик предупреждений сброшен.")
+            await msg.reply(f"⛔ {t_link} получил автобан на <b>3 дня</b> (лимит 4/3). Счётчик предупреждений сброшен.")
         return
 
     if cmd == "mcmute":
-        # /mcmute @u 15m причина  OR reply: /mcmute 15m причина
         if msg.reply_to_message:
             dur_sec = parse_duration(parts[1]) if len(parts) >= 2 else None
             reason = " ".join(parts[2:]).strip() or reason
@@ -907,11 +930,10 @@ async def mc_commands_router(msg: Message):
 
         await apply_mute(msg.chat.id, target, dur_sec)
         mc_upsert(msg.chat.id, target, t_uname, "mute", until, reason, msg.from_user.id, 1)
-        await msg.reply(f"🔇 Мут до: <b>{until_txt}</b>\nПричина: <i>{reason}</i>")
+        await msg.reply(f"🔇 {t_link} получил мут до: <b>{until_txt}</b>\nПричина: <i>{escape(reason)}</i>")
         return
 
     if cmd == "mcban":
-        # /mcban @u 1d причина  OR reply: /mcban 1d причина
         if msg.reply_to_message:
             dur_sec = parse_duration(parts[1]) if len(parts) >= 2 else None
             reason = " ".join(parts[2:]).strip() or reason
@@ -922,7 +944,7 @@ async def mc_commands_router(msg: Message):
         until = None if dur_sec is None else ts() + dur_sec
         await apply_ban(msg.chat.id, target, dur_sec)
         mc_upsert(msg.chat.id, target, t_uname, "ban", until, reason, msg.from_user.id, 1)
-        await msg.reply(f"⛔ Бан до: <b>{fmt_dt(until)}</b> {active_tag(until)}\nПричина: <i>{reason}</i>")
+        await msg.reply(f"⛔ {t_link} получил бан до: <b>{fmt_dt(until)}</b> {active_tag(until)}\nПричина: <i>{escape(reason)}</i>")
         return
 
     if cmd == "mckick":
@@ -934,36 +956,35 @@ async def mc_commands_router(msg: Message):
         await bot.ban_chat_member(msg.chat.id, target)
         await bot.unban_chat_member(msg.chat.id, target)
         mc_upsert(msg.chat.id, target, t_uname, "kick", ts(), reason, msg.from_user.id, 0)
-        await msg.reply(f"👢 Кик выполнен.\nПричина: <i>{reason}</i>")
+        await msg.reply(f"👢 {t_link} был кикнут.\nПричина: <i>{escape(reason)}</i>")
         return
 
     if cmd == "mcunwarn":
         admin_warn_set(msg.chat.id, target, 0)
         mc_upsert(msg.chat.id, target, t_uname, "warn", ts(), "снято", msg.from_user.id, 0)
-        await msg.reply("✅ Предупреждения сброшены.")
+        await msg.reply(f"✅ Предупреждения для {t_link} сброшены.")
         return
 
     if cmd == "mcunmute":
         await bot.restrict_chat_member(msg.chat.id, target, permissions=FULL_PERMS)
         mc_upsert(msg.chat.id, target, t_uname, "mute", ts(), "снято", msg.from_user.id, 0)
-        await msg.reply("✅ Мут снят.")
+        await msg.reply(f"✅ Мут для {t_link} снят.")
         return
 
     if cmd == "mcunban":
         await bot.unban_chat_member(msg.chat.id, target)
         mc_upsert(msg.chat.id, target, t_uname, "ban", ts(), "снято", msg.from_user.id, 0)
-        await msg.reply("✅ Бан снят.")
+        await msg.reply(f"✅ Бан для {t_link} снят.")
         return
 
 
 # =========================
-# ГРУППА: АНТИ-РЕКЛАМА (НЕ ТРОГАЕТ КОМАНДЫ)
+# ГРУППА: АНТИ-РЕКЛАМА
 # =========================
 @dp.message(F.chat.type.in_({"group", "supergroup"}), (F.text | F.caption))
 async def anti_ads(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
-    # команды не трогаем
     if is_command_text(msg.text) or is_command_text(msg.caption):
         return
 
@@ -971,7 +992,7 @@ async def anti_ads(msg: Message):
     if not text:
         return
 
-    ad, reason = is_ad_message(text)
+    ad, raw_reason = is_ad_message(text)
 
     # если не реклама и нет хэштега — игнор
     if (not ad) and (not has_hashtag(text)):
@@ -998,20 +1019,21 @@ async def anti_ads(msg: Message):
             "🗑️ Ваше сообщение удалено, по причине отсутствия тега на рекламу.\n"
             f"Пожалуйста укажите тег <b>\"{HASHTAG}\"</b> в конце."
         )
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({reason})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({raw_reason})")
         return
 
-    # есть разрешение и реклама — лимит 24ч
+    # есть разрешение и реклама — лимит 24ч + остаток
     if permit_ok and ad:
         if last_ad_ts and (ts() - last_ad_ts) < ADS_COOLDOWN_SECONDS:
+            left = ADS_COOLDOWN_SECONDS - (ts() - last_ad_ts)
             await try_delete(msg)
-            await bot.send_message(chat_id, "⏳ Рекламу можно отправлять раз в <b>24 часа</b>.")
+            await bot.send_message(chat_id, f"⏳ Рекламу можно отправлять раз в <b>24 часа</b>.\nОсталось: <b>{fmt_left(left)}</b>")
             log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "лимит 24 часа")
             return
         permit_touch_last_ad(chat_id, uid)
         return
 
-    # нет разрешения и реклама — стадии
+    # нет разрешения и реклама — стадии (в сообщениях причина = "реклама")
     if (not permit_ok) and ad:
         await try_delete(msg)
         stage = ad_stage_get(chat_id, uid)
@@ -1021,7 +1043,7 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "⚠️ <b>Предупреждение</b>\n"
-                f"Причина: {reason}\n"
+                "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}"
             )
@@ -1034,7 +1056,7 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "🔇 <b>Мут 3 часа</b>\n"
-                f"Причина: {reason}\n"
+                "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}"
             )
@@ -1047,13 +1069,13 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "🔇 <b>Мут 12 часов</b>\n"
-                f"Причина: {reason}\n"
+                "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}\n\n"
                 "✅ Счётчик нарушений сброшен."
             )
 
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({reason})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({raw_reason})")
         return
 
 
