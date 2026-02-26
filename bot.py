@@ -100,6 +100,20 @@ def mention_html(user_id: int, full_name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
+# >>> ADD: красивый таймер "сколько осталось"
+def fmt_left(seconds_left: int) -> str:
+    if seconds_left < 0:
+        seconds_left = 0
+    h = seconds_left // 3600
+    m = (seconds_left % 3600) // 60
+    s = seconds_left % 60
+    if h > 0:
+        return f"{h}ч {m}м {s}с"
+    if m > 0:
+        return f"{m}м {s}с"
+    return f"{s}с"
+
+
 # =========================
 # АНТИ-РЕКЛАМА (правила)
 # =========================
@@ -1217,12 +1231,25 @@ async def anti_ads(msg: Message):
 
     permit_ok, _permit_until, last_ad_ts = permit_get(chat_id, uid)
 
+    # >>> ADD: кликабельный ник для сообщений анти-рекламы
+    user_mention = mention_html(uid, msg.from_user.full_name)
+
     # (1) без разрешения, но пишет #реклама
     if (not permit_ok) and has_hashtag(text):
         deleted = await try_delete(msg)
         if not deleted:
             await ensure_delete_warning(chat_id)
-        await bot.send_message(chat_id, f"❌ У вас нет разрешения на рекламу.\nПолучить: {SUPPORT_BOT_FOR_PERMIT}")
+
+        # >>> CHANGED: было "❌ У вас нет разрешения..." -> теперь с ником и "ваше сообщение удалено"
+        await bot.send_message(
+            chat_id,
+            f"{user_mention}, ваше сообщение удалено.\n"
+            f"Причина: реклама (нет разрешения)\n"
+            f"Правила: {RULES_LINK}\n"
+            f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
+            f'В разделе "Связь с админом".'
+        )
+
         log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "нет разрешения, но есть #реклама")
         return
 
@@ -1231,11 +1258,15 @@ async def anti_ads(msg: Message):
         deleted = await try_delete(msg)
         if not deleted:
             await ensure_delete_warning(chat_id)
+
+        # >>> CHANGED: добавили ник + "ваше сообщение удалено"
         await bot.send_message(
             chat_id,
-            "🗑️ Ваше сообщение удалено, по причине отсутствия тега на рекламу.\n"
+            f"{user_mention}, ваше сообщение удалено.\n"
+            f'Причина: нет тега "{HASHTAG}" в конце\n'
             f"Пожалуйста укажите тег <b>\"{HASHTAG}\"</b> <b>в конце</b>."
         )
+
         log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({reason_detail})")
         return
 
@@ -1245,9 +1276,18 @@ async def anti_ads(msg: Message):
             deleted = await try_delete(msg)
             if not deleted:
                 await ensure_delete_warning(chat_id)
-            await bot.send_message(chat_id, "⏳ Рекламу можно отправлять раз в <b>24 часа</b>.")
+
+            # >>> CHANGED: таймер сколько осталось
+            left = ADS_COOLDOWN_SECONDS - (ts() - last_ad_ts)
+            await bot.send_message(
+                chat_id,
+                f"⏳ {user_mention}, рекламу можно отправлять раз в <b>24 часа</b>.\n"
+                f"Осталось ждать: <b>{fmt_left(left)}</b>"
+            )
+
             log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "лимит 24 часа")
             return
+
         permit_touch_last_ad(chat_id, uid)
         return
 
