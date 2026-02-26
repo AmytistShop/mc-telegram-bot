@@ -45,6 +45,10 @@ ADMIN_WARN_AUTOBAN_SECONDS = 3 * 24 * 60 * 60
 RULES_LINK = "https://leoned777.github.io/chats/"
 SUPPORT_BOT_FOR_PERMIT = "@minecrfat_bot"  # как ты попросил
 
+# ВСТАВЬ СТИКЕР ID (по желанию). Если пусто/None — стикер не отправляется.
+# Пример: "CAACAgIAAxkBAA..." (file_id стикера)
+AD_WARN_STICKER_ID = None
+
 # /mclist — по 10 записей
 MC_LIST_PAGE_SIZE = 10
 
@@ -94,6 +98,10 @@ def hashtag_at_end(text: str) -> bool:
 
 def has_hashtag(text: str) -> bool:
     return HASHTAG in (text or "").lower()
+
+def mention_html(user_id: int, full_name: str) -> str:
+    safe_name = (full_name or "Пользователь").replace("<", "").replace(">", "")
+    return f'<a href="tg://user?id={user_id}">{safe_name}</a>'
 
 
 # =========================
@@ -283,51 +291,6 @@ def support_users_list() -> list[int]:
     return [int(r[0]) for r in rows]
 
 
-# ----- админские предупреждения -----
-def admin_warn_get(chat_id: int, user_id: int) -> int:
-    con = db()
-    row = con.execute("SELECT count FROM admin_warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
-    con.close()
-    return int(row[0]) if row else 0
-
-def admin_warn_set(chat_id: int, user_id: int, count: int):
-    con = db()
-    con.execute("INSERT OR REPLACE INTO admin_warns(chat_id, user_id, count) VALUES (?,?,?)", (chat_id, user_id, count))
-    con.commit()
-    con.close()
-
-
-# ----- наказания для /mclist -----
-def mc_upsert(chat_id: int, user_id: int, username: str | None, kind: str, until_ts: int | None, reason: str, issued_by: int, active: int):
-    con = db()
-    con.execute(
-        """
-        INSERT OR REPLACE INTO mc_punishments(chat_id,user_id,username,kind,until_ts,reason,issued_ts,issued_by,active)
-        VALUES (?,?,?,?,?,?,?,?,?)
-        """,
-        (chat_id, user_id, username or "", kind, until_ts, reason, ts(), issued_by, active)
-    )
-    con.commit()
-    con.close()
-
-def mc_list(chat_id: int, page: int) -> tuple[list[tuple], int]:
-    con = db()
-    total = con.execute("SELECT COUNT(*) FROM mc_punishments WHERE chat_id=?", (chat_id,)).fetchone()[0]
-    offset = (page - 1) * MC_LIST_PAGE_SIZE
-    rows = con.execute(
-        """
-        SELECT user_id, username, kind, until_ts, reason, issued_ts, active
-        FROM mc_punishments
-        WHERE chat_id=?
-        ORDER BY issued_ts DESC
-        LIMIT ? OFFSET ?
-        """,
-        (chat_id, MC_LIST_PAGE_SIZE, offset)
-    ).fetchall()
-    con.close()
-    return rows, int(total)
-
-
 # =========================
 # FSM (ЛС)
 # =========================
@@ -397,7 +360,7 @@ dp = Dispatcher()
 
 
 # =========================
-# УДАЛЕНИЕ СООБЩЕНИЙ (честно)
+# УДАЛЕНИЕ СООБЩЕНИЙ
 # =========================
 async def try_delete(msg: Message) -> bool:
     try:
@@ -407,11 +370,10 @@ async def try_delete(msg: Message) -> bool:
         return False
 
 async def ensure_delete_warning(chat_id: int):
-    # коротко и по делу — чтобы ты понимал почему "не удаляет"
     await bot.send_message(
         chat_id,
         "⚠️ Я не смог удалить сообщение.\n"
-        "Дай мне права: <b>Delete messages</b> (сделай админом) и включи удаление сообщений."
+        "Дай мне права: <b>Delete messages</b> (сделай админом)."
     )
 
 
@@ -457,16 +419,13 @@ async def cmd_chatid(msg: Message):
 
 @dp.message(Command("userid"))
 async def cmd_userid(msg: Message):
-    # reply -> id цели
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         await msg.reply(f"🆔 ID пользователя: <code>{u.id}</code>")
         return
-    # forward -> id (если не скрыто)
     if msg.forward_from:
         await msg.reply(f"🆔 ID пользователя: <code>{msg.forward_from.id}</code>")
         return
-    # иначе свой
     await msg.reply(f"🆔 Твой ID: <code>{msg.from_user.id}</code>")
 
 
@@ -745,7 +704,6 @@ async def st_sup_reply(msg: Message, state: FSMContext):
 # =========================
 @dp.message(F.chat.type == "private")
 async def private_catchall(msg: Message):
-    # неизвестные команды в ЛС
     if msg.text and msg.text.startswith("/"):
         if msg.text not in ("/start", "/cancel", "/chatid", "/userid"):
             await msg.answer("ℹ️ Нажми /start чтобы открыть меню.")
@@ -768,13 +726,12 @@ async def private_catchall(msg: Message):
 
 
 # =========================
-# ГРУППА: АНТИ-РЕКЛАМА (НЕ ТРОГАЕТ КОМАНДЫ)
+# ГРУППА: АНТИ-РЕКЛАМА
 # =========================
 @dp.message(F.chat.type.in_({"group", "supergroup"}) & (F.text | F.caption))
 async def anti_ads(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
-    # команды не трогаем
     if is_command_text(msg.text) or is_command_text(msg.caption):
         return
 
@@ -782,9 +739,8 @@ async def anti_ads(msg: Message):
     if not text:
         return
 
-    ad, reason = is_ad_message(text)
+    ad, reason_detail = is_ad_message(text)
 
-    # если не реклама и нет хэштега — игнор
     if (not ad) and (not has_hashtag(text)):
         return
 
@@ -813,7 +769,7 @@ async def anti_ads(msg: Message):
             "🗑️ Ваше сообщение удалено, по причине отсутствия тега на рекламу.\n"
             f"Пожалуйста укажите тег <b>\"{HASHTAG}\"</b> <b>в конце</b>."
         )
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({reason})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({reason_detail})")
         return
 
     # (3) есть разрешение и реклама — лимит 24ч
@@ -835,17 +791,28 @@ async def anti_ads(msg: Message):
             await ensure_delete_warning(chat_id)
 
         stage = ad_stage_get(chat_id, uid)
+        user_mention = mention_html(uid, msg.from_user.full_name)
 
         if stage == 0:
             ad_stage_set(chat_id, uid, 1)
+
+            # СТИКЕР (если задан)
+            if AD_WARN_STICKER_ID:
+                try:
+                    await bot.send_sticker(chat_id, AD_WARN_STICKER_ID)
+                except Exception:
+                    pass
+
+            # ТЕКСТ КАК ТЫ ПРОСИЛ
             await bot.send_message(
                 chat_id,
-                f"⚠️ Реклама без разрешения запрещена.\n"
-                f"Причина: {reason}\n"
+                f"{user_mention}, ваше сообщение удалено.\n"
+                f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
                 f'В разделе "Связь с админом".'
             )
+
         elif stage == 1:
             ad_stage_set(chat_id, uid, 2)
             try:
@@ -854,8 +821,8 @@ async def anti_ads(msg: Message):
                 pass
             await bot.send_message(
                 chat_id,
-                f"🔇 Мут на <b>3 часа</b>.\n"
-                f"Причина: {reason}\n"
+                f"🔇 {user_mention} — мут на <b>3 часа</b>.\n"
+                f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
                 f'В разделе "Связь с админом".'
@@ -868,15 +835,15 @@ async def anti_ads(msg: Message):
                 pass
             await bot.send_message(
                 chat_id,
-                f"🔇 Мут на <b>12 часов</b>.\n"
-                f"Причина: {reason}\n"
+                f"🔇 {user_mention} — мут на <b>12 часов</b>.\n"
+                f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
                 f'В разделе "Связь с админом".\n\n'
                 f"✅ Счётчик нарушений сброшен."
             )
 
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({reason})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({reason_detail})")
         return
 
 
@@ -884,9 +851,8 @@ async def anti_ads(msg: Message):
 # Команды для подсказок "/"
 # =========================
 async def setup_commands():
-    cmds = [
-        BotCommand(command="start", description="Меню бота"),
-        BotCommand(command="cancel", description="Отмена/выход в меню"),
+    # ГРУППЫ: только нужное (без /start /cancel /mcunlock)
+    group_cmds = [
         BotCommand(command="chatid", description="Показать chat_id (в группе)"),
         BotCommand(command="userid", description="Узнать ID (reply/forward/свой)"),
 
@@ -898,13 +864,20 @@ async def setup_commands():
         BotCommand(command="mcunwarn", description="Снять предупреждения"),
         BotCommand(command="mcunmute", description="Снять мут"),
         BotCommand(command="mcunban", description="Снять бан"),
-        BotCommand(command="mcunlock", description="Снять бан/мут"),
     ]
 
-    # одинаковые команды по умолчанию (Telegram покажет их при "/")
-    await bot.set_my_commands(cmds, scope=BotCommandScopeDefault())
-    await bot.set_my_commands(cmds, scope=BotCommandScopeAllGroupChats())
-    await bot.set_my_commands(cmds, scope=BotCommandScopeAllPrivateChats())
+    # ЛС: можно оставлять /start /cancel
+    private_cmds = [
+        BotCommand(command="start", description="Меню бота"),
+        BotCommand(command="cancel", description="Отмена/выход в меню"),
+        BotCommand(command="chatid", description="Показать chat_id (в группе)"),
+        BotCommand(command="userid", description="Узнать ID (reply/forward/свой)"),
+    ]
+
+    # Default можно оставить минимальным (как в ЛС)
+    await bot.set_my_commands(private_cmds, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(group_cmds, scope=BotCommandScopeAllGroupChats())
+    await bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
 
 
 # =========================
