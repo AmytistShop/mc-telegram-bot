@@ -9,17 +9,6 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
-    InlineKeyboardMarkup, InlineKeyboardButtimport os
-import re
-import sqlite3
-from datetime import datetime, timedelta, timezone
-from html import escape
-
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
-from aiogram.types import (
-    Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ChatPermissions,
 )
