@@ -902,7 +902,267 @@ async def cb_vip(cq: CallbackQuery):
     await cq.message.edit_text("⭐ <b>VIP подписка</b>\n\nПока в разработке 🙂", reply_markup=kb_back("menu"))
     await cq.answer()
 
+# =========================
+# ЛС: Разрешения / Рассылка / Support (CALLBACK + FSM)
+# =========================
 
+@dp.callback_query(F.data == "perm_menu")
+async def cb_perm_menu(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await cq.message.edit_text(
+        "✅ <b>Разрешения на рекламу</b>\n\n"
+        "После выбора действия <b>не нужны команды</b> — просто пришли:\n"
+        "• <code>@username</code>\n"
+        "• или <code>ID</code>\n"
+        "• или <b>перешли сообщение</b> пользователя\n\n"
+        "Можно указать срок: <code>@user 15m</code>\n"
+        "Если срок не указать — навсегда.",
+        reply_markup=kb_perm()
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "perm_give")
+async def cb_perm_give(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_permit_give)
+    await cq.message.edit_text(
+        "➕ <b>Выдать разрешение</b>\n\n"
+        "Пришли: <code>@username</code> / <code>ID</code> / пересланное сообщение.\n"
+        "Срок можно добавить: <code>@user 1d</code>\n"
+        "Если срок не указать — навсегда.",
+        reply_markup=kb_back("perm_menu")
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "perm_remove")
+async def cb_perm_remove(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminStates.waiting_permit_remove)
+    await cq.message.edit_text(
+        "➖ <b>Забрать разрешение</b>\n\n"
+        "Пришли: <code>@username</code> / <code>ID</code> / пересланное сообщение.",
+        reply_markup=kb_back("perm_menu")
+    )
+    await cq.answer()
+
+
+async def resolve_user_id_from_input(msg: Message, raw: str | None) -> int | None:
+    # 1) forward (если не скрыт)
+    if msg.forward_from:
+        return msg.forward_from.id
+
+    # 2) id числом
+    if raw and raw.strip().isdigit():
+        return int(raw.strip())
+
+    # 3) @username -> get_chat
+    if raw:
+        t = raw.strip()
+        if t.startswith("@"):
+            t = t[1:]
+        try:
+            ch = await bot.get_chat(t)
+            return int(ch.id)
+        except Exception:
+            return None
+    return None
+
+
+@dp.message(AdminStates.waiting_permit_give)
+async def st_perm_give(msg: Message, state: FSMContext):
+    if msg.chat.type != "private" or not is_admin(msg.from_user.id):
+        return
+
+    parts = (msg.text or "").strip().split()
+    raw_target = parts[0] if parts else None
+    raw_dur = parts[1] if len(parts) >= 2 else None
+
+    uid = await resolve_user_id_from_input(msg, raw_target)
+    if uid is None:
+        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.")
+        return
+
+    dur_sec = parse_duration(raw_dur)
+    until_ts = None if dur_sec is None else ts() + dur_sec
+
+    chats = get_known_chats()
+    if not chats:
+        await msg.answer("⚠️ Я ещё не знаю чаты. Напиши что-нибудь в группе с ботом и повтори.")
+        return
+
+    for chat_id, _ in chats:
+        permit_set(chat_id, uid, until_ts)
+
+    await state.clear()
+    await msg.answer(
+        "✅ <b>Разрешение выдано</b>\n\n"
+        f"🆔 <code>{uid}</code>\n"
+        f"⏳ До: <b>{fmt_dt(until_ts)}</b>",
+        reply_markup=kb_main(True)
+    )
+
+
+@dp.message(AdminStates.waiting_permit_remove)
+async def st_perm_remove(msg: Message, state: FSMContext):
+    if msg.chat.type != "private" or not is_admin(msg.from_user.id):
+        return
+
+    parts = (msg.text or "").strip().split()
+    raw_target = parts[0] if parts else None
+
+    uid = await resolve_user_id_from_input(msg, raw_target)
+    if uid is None:
+        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.")
+        return
+
+    chats = get_known_chats()
+    for chat_id, _ in chats:
+        permit_remove(chat_id, uid)
+
+    await state.clear()
+    await msg.answer(
+        "🗑️ <b>Разрешение убрано</b>\n\n"
+        f"🆔 <code>{uid}</code>",
+        reply_markup=kb_main(True)
+    )
+
+
+# =========================
+# ЛС: Рассылка
+# =========================
+@dp.callback_query(F.data == "bc_menu")
+async def cb_bc_menu(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+
+    chats = get_known_chats()
+    if not chats:
+        await cq.message.edit_text(
+            "📣 <b>Рассылка</b>\n\n"
+            "Пока нет чатов в списке.\n"
+            "Напиши что-нибудь в группе с ботом — и чат появится.",
+            reply_markup=kb_back("menu")
+        )
+        await cq.answer()
+        return
+
+    await state.set_state(AdminStates.waiting_broadcast_chat)
+    await cq.message.edit_text("📣 <b>Выбери чат</b>:", reply_markup=kb_bc_chats(chats))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("bc_chat:"))
+async def cb_bc_chat(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+
+    chat_id = int(cq.data.split(":")[1])
+    await state.update_data(bc_chat_id=chat_id)
+    await state.set_state(AdminStates.waiting_broadcast_message)
+    await cq.message.edit_text(
+        "✉️ <b>Отправь сообщение для рассылки</b>\n\n"
+        "Текст/фото/видео/док — всё можно.",
+        reply_markup=kb_back("menu")
+    )
+    await cq.answer()
+
+
+@dp.message(AdminStates.waiting_broadcast_message)
+async def st_bc_send(msg: Message, state: FSMContext):
+    if msg.chat.type != "private" or not is_admin(msg.from_user.id):
+        return
+    data = await state.get_data()
+    chat_id = data.get("bc_chat_id")
+
+    if not chat_id:
+        await state.clear()
+        await msg.answer("⚠️ Сначала выбери чат.", reply_markup=kb_main(True))
+        return
+
+    try:
+        await bot.copy_message(chat_id=chat_id, from_chat_id=msg.chat.id, message_id=msg.message_id)
+        await msg.answer("✅ Отправлено.", reply_markup=kb_main(True))
+    except Exception as e:
+        await msg.answer(f"❌ Ошибка отправки: <code>{type(e).__name__}</code>", reply_markup=kb_main(True))
+    finally:
+        await state.clear()
+
+
+# =========================
+# ЛС: Support
+# =========================
+@dp.callback_query(F.data == "support_user")
+async def cb_support_user(cq: CallbackQuery):
+    await cq.message.edit_text(
+        "☎️ <b>Связь с админом</b>\n\n"
+        "Напиши сюда сообщение — я перешлю админу.",
+        reply_markup=kb_back("menu")
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "support_admin")
+async def cb_support_admin(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+
+    users = support_users_list()
+    if not users:
+        await cq.message.edit_text("💬 Сообщений пока нет.", reply_markup=kb_back("menu"))
+        await cq.answer()
+        return
+
+    await state.set_state(AdminStates.waiting_support_reply_pick)
+    await cq.message.edit_text("💬 <b>Выбери пользователя</b>:", reply_markup=kb_support_admin_users(users))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("sup_user:"))
+async def cb_sup_user_pick(cq: CallbackQuery, state: FSMContext):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+
+    uid = int(cq.data.split(":")[1])
+    await state.update_data(support_uid=uid)
+    await state.set_state(AdminStates.waiting_support_reply_text)
+    await cq.message.edit_text(
+        f"✍️ Напиши ответ пользователю <code>{uid}</code>:",
+        reply_markup=kb_back("support_admin")
+    )
+    await cq.answer()
+
+
+@dp.message(AdminStates.waiting_support_reply_text)
+async def st_sup_reply(msg: Message, state: FSMContext):
+    if msg.chat.type != "private" or not is_admin(msg.from_user.id):
+        return
+
+    data = await state.get_data()
+    uid = data.get("support_uid")
+
+    if not uid:
+        await state.clear()
+        await msg.answer("⚠️ Сначала выбери пользователя.", reply_markup=kb_main(True))
+        return
+
+    try:
+        await bot.send_message(uid, f"💬 <b>Ответ администратора:</b>\n\n{msg.text or ''}")
+        await msg.answer("✅ Отправлено.", reply_markup=kb_main(True))
+    finally:
+        await state.clear()
 # =========================
 # PRIVATE CATCHALL (ЛС)
 # =========================
