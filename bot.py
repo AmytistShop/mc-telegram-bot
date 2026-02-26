@@ -9,7 +9,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    ChatPermissions
+    ChatPermissions,
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -18,16 +18,16 @@ from aiogram.fsm.context import FSMContext
 # =========================
 # НАСТРОЙКИ
 # =========================
-TOKEN = os.environ.get("TOKEN")
+TOKEN = (os.getenv("TOKEN") or "").strip()
 if not TOKEN:
-    raise RuntimeError("TOKEN is not set. Add environment variable TOKEN in Render.")
+    raise RuntimeError("TOKEN is not set. Add env var TOKEN in Render (no quotes, no spaces).")
 
 ADMIN_IDS = {8085895186}
 
 DB_PATH = "mc_bot.db"
 HASHTAG = "#реклама"
 
-# анти-реклама: стадии наказаний бота
+# анти-реклама: стадии наказаний
 MUTE_2_SECONDS = 3 * 60 * 60       # 3 часа
 MUTE_3_SECONDS = 12 * 60 * 60      # 12 часов
 
@@ -41,11 +41,24 @@ ADMIN_WARN_AUTOBAN_SECONDS = 3 * 24 * 60 * 60
 RULES_LINK = "https://leoned777.github.io/chats/"
 SUPPORT_BOT = "@minecraft_chat_igra_bot"
 
-# логи удалённой рекламы
-PAGE_SIZE_LOGS = 5
-
-# /mclist — по 10 записей на страницу
 MC_LIST_PAGE_SIZE = 10
+
+FULL_PERMS = ChatPermissions(
+    can_send_messages=True,
+    can_send_audios=True,
+    can_send_documents=True,
+    can_send_photos=True,
+    can_send_videos=True,
+    can_send_video_notes=True,
+    can_send_voice_notes=True,
+    can_send_polls=True,
+    can_send_other_messages=True,
+    can_add_web_page_previews=True,
+    can_change_info=True,
+    can_invite_users=True,
+    can_pin_messages=True,
+    can_manage_topics=True,
+)
 
 
 # =========================
@@ -105,11 +118,11 @@ PHONE = re.compile(r"(\+?\d[\d\-\s\(\)]{8,}\d)")
 def is_ad_message(text: str | None) -> tuple[bool, str]:
     """
     Возвращает (True/False, причина)
-    @username НЕ считается рекламой (как ты просил).
+    @username НЕ считается рекламой.
     """
     t = (text or "").lower()
-    if TELELEGRAM_USERNAME_ONLY(t):
-        pass
+
+    # НЕ ищем @username
     if TELEGRAM_LINK.search(t):
         return True, "ссылка t.me"
     if PHONE.search(t):
@@ -118,10 +131,6 @@ def is_ad_message(text: str | None) -> tuple[bool, str]:
         if w in t:
             return True, f'ключевое слово: "{w}"'
     return False, ""
-
-def TELELEGRAM_USERNAME_ONLY(t: str) -> bool:
-    # спец-заглушка, чтобы не считать @username рекламой — мы просто не ищем по @ вовсе
-    return False
 
 
 # =========================
@@ -173,22 +182,19 @@ def db():
         user_id INTEGER PRIMARY KEY,
         last_ts INTEGER NOT NULL DEFAULT 0
     )""")
-
-    # ✅ наказания, которые выдаёт админ (для /mclist)
     con.execute("""
     CREATE TABLE IF NOT EXISTS mc_punishments (
         chat_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
         username TEXT,
-        kind TEXT NOT NULL,             -- warn/mute/ban/kick
-        until_ts INTEGER,               -- null=навсегда
+        kind TEXT NOT NULL,
+        until_ts INTEGER,
         reason TEXT,
         issued_ts INTEGER NOT NULL,
         issued_by INTEGER NOT NULL,
         active INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY(chat_id, user_id, kind)
     )""")
-
     con.commit()
     return con
 
@@ -351,7 +357,7 @@ class AdminStates(StatesGroup):
 
 
 # =========================
-# КЛАВИАТУРЫ (ЛС)
+# КЛАВИАТУРЫ
 # =========================
 def kb_main(is_admin_flag: bool) -> InlineKeyboardMarkup:
     rows = [
@@ -413,10 +419,10 @@ dp = Dispatcher()
 async def cmd_start(msg: Message, state: FSMContext):
     await state.clear()
     flag = is_admin(msg.from_user.id)
+    # В ГЛАВНОМ МЕНЮ УБРАЛ "Правила..."
     await msg.answer(
         "🏠 <b>Главное меню</b>\n\n"
-        f"📌 Тег рекламы в конце: <code>{HASHTAG}</code>\n"
-        f"📖 Правила: {RULES_LINK}",
+        f"📌 Тег рекламы в конце: <code>{HASHTAG}</code>",
         reply_markup=kb_main(flag)
     )
 
@@ -474,7 +480,7 @@ async def cb_vip(cq: CallbackQuery):
 
 
 # =========================
-# Разрешения (ЛС без команд)
+# Разрешения (ЛС)
 # =========================
 @dp.callback_query(F.data == "perm_menu")
 async def cb_perm_menu(cq: CallbackQuery, state: FSMContext):
@@ -597,7 +603,7 @@ async def st_perm_remove(msg: Message, state: FSMContext):
 
 
 # =========================
-# Рассылка (ЛС без /bc)
+# Рассылка (ЛС)
 # =========================
 @dp.callback_query(F.data == "bc_menu")
 async def cb_bc_menu(cq: CallbackQuery, state: FSMContext):
@@ -711,7 +717,6 @@ async def st_sup_reply(msg: Message, state: FSMContext):
 @dp.message(F.chat.type == "private")
 async def private_catchall(msg: Message):
     if msg.text and msg.text.startswith("/"):
-        # неизвестные команды в ЛС
         if msg.text not in ("/start", "/cancel", "/chatid"):
             await msg.answer("ℹ️ Нажми /start чтобы открыть меню.")
         return
@@ -756,6 +761,7 @@ async def get_target_from_command(msg: Message) -> int | None:
     # reply
     if msg.reply_to_message and msg.reply_to_message.from_user:
         return msg.reply_to_message.from_user.id
+
     # @username / id
     parts = (msg.text or "").split()
     if len(parts) >= 2:
@@ -775,9 +781,9 @@ def parse_cmd_parts(msg: Message) -> list[str]:
 
 
 # =========================
-# ГРУППА: /mclist (и /list как alias)
+# ГРУППА: /mclist
 # =========================
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & (Command("mclist") | Command("list")))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), Command("mclist"))
 async def cmd_mclist(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
@@ -813,83 +819,52 @@ async def cmd_mclist(msg: Message):
 
 
 # =========================
-# ГРУППА: КОМАНДЫ НАКАЗАНИЙ (поддержка /mc* и без mc)
+# ГРУППА: ТОЛЬКО MC-КОМАНДЫ НАКАЗАНИЙ
+# (УБРАНЫ /ban /mute /warn /kick И УБРАН /mcunlock)
 # =========================
 HELP_FORMS = {
-    "warn":  'Форма: <code>/mcwarn @user причина</code> или ответом: <code>/mcwarn причина</code>',
-    "mute":  'Форма: <code>/mcmute @user 15m причина</code> или ответом: <code>/mcmute 15m причина</code>',
-    "ban":   'Форма: <code>/mcban @user 1d причина</code> или ответом: <code>/mcban 1d причина</code>',
-    "kick":  'Форма: <code>/mckick @user причина</code> или ответом: <code>/mckick причина</code>',
-    "unwarn":"Форма: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>',
-    "unmute":"Форма: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>',
-    "unban": "Форма: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>',
-    "unlock":"Форма: <code>/mcunlock @user</code> или ответом: <code>/mcunlock</code>',
+    "mcwarn":   "Форма: <code>/mcwarn @user причина</code> или ответом: <code>/mcwarn причина</code>",
+    "mcmute":   "Форма: <code>/mcmute @user 15m причина</code> или ответом: <code>/mcmute 15m причина</code>",
+    "mcban":    "Форма: <code>/mcban @user 1d причина</code> или ответом: <code>/mcban 1d причина</code>",
+    "mckick":   "Форма: <code>/mckick @user причина</code> или ответом: <code>/mckick причина</code>",
+    "mcunwarn": "Форма: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>",
+    "mcunmute": "Форма: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>",
+    "mcunban":  "Форма: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>",
 }
 
-def cmd_is_any(msg: Message, names: set[str]) -> bool:
-    t = (msg.text or "").split()
-    if not t:
-        return False
-    cmd = t[0].lstrip("/").split("@")[0].lower()
-    return cmd in names
-
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & F.text)
+# ВАЖНО: этот хендлер ловит ТОЛЬКО /mc... команды,
+# чтобы антиреклама работала на обычных сообщениях.
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text.startswith("/mc"))
 async def mc_commands_router(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
-    # пропускаем всё, что не наши команды
-    if not is_command_text(msg.text):
+    parts = parse_cmd_parts(msg)
+    if not parts:
         return
 
-    # список команд
-    WARN = {"warn", "mcwarn"}
-    MUTE = {"mute", "mcmute"}
-    BAN  = {"ban", "mcban"}
-    KICK = {"kick", "mckick"}
-    UNWARN = {"unwarn", "mcunwarn"}
-    UNMUTE = {"unmute", "mcunmute"}
-    UNBAN  = {"unban", "mcunban"}
-    UNLOCK = {"unlock", "mcunlock"}
-
-    parts = parse_cmd_parts(msg)
     cmd = parts[0].lstrip("/").split("@")[0].lower()
 
-    # бот реагирует только на админов
+    # только эти команды
+    CMDS = {"mcwarn", "mcmute", "mcban", "mckick", "mcunwarn", "mcunmute", "mcunban"}
+    if cmd not in CMDS:
+        return  # неизвестная /mc команда — игнор
+
     if not is_admin(msg.from_user.id):
         return
 
-    # подсказки если без аргументов (кроме reply)
-    if cmd in WARN and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["warn"])
-    if cmd in MUTE and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["mute"])
-    if cmd in BAN and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["ban"])
-    if cmd in KICK and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["kick"])
-    if cmd in UNWARN and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["unwarn"])
-    if cmd in UNMUTE and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["unmute"])
-    if cmd in UNBAN and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["unban"])
-    if cmd in UNLOCK and len(parts) == 1 and not msg.reply_to_message:
-        return await msg.reply(HELP_FORMS["unlock"])
+    # подсказка без аргументов (кроме reply)
+    if cmd in HELP_FORMS and len(parts) == 1 and not msg.reply_to_message:
+        return await msg.reply(HELP_FORMS[cmd])
 
-    # цель
     target = await get_target_from_command(msg)
     if target is None:
         return await msg.reply("❌ Не смог определить пользователя. Ответь на сообщение или укажи @user/ID.")
 
-    # username цели (если reply)
     t_uname = msg.reply_to_message.from_user.username if msg.reply_to_message else None
-
-    # reason + duration
     reason = "причина не указана"
     dur_sec = None
 
-    if cmd in WARN:
-        # /mcwarn @u причина  OR reply: /mcwarn причина
+    if cmd == "mcwarn":
         if msg.reply_to_message:
             reason = " ".join(parts[1:]).strip() or reason
         else:
@@ -898,20 +873,22 @@ async def mc_commands_router(msg: Message):
         cnt = admin_warn_get(msg.chat.id, target) + 1
         admin_warn_set(msg.chat.id, target, cnt)
 
-        # лог в mclist
         mc_upsert(msg.chat.id, target, t_uname, "warn", None, reason, msg.from_user.id, 1)
-
         await msg.reply(f"⚠️ Предупреждение <b>{cnt}/3</b>\nПричина: <i>{reason}</i>")
 
         if cnt >= ADMIN_WARN_LIMIT:
             await apply_ban(msg.chat.id, target, ADMIN_WARN_AUTOBAN_SECONDS)
             admin_warn_set(msg.chat.id, target, 0)
-            # перезаписываем ban
-            mc_upsert(msg.chat.id, target, t_uname, "ban", ts()+ADMIN_WARN_AUTOBAN_SECONDS, "автобан за 4/3 предупреждений", msg.from_user.id, 1)
+            mc_upsert(
+                msg.chat.id, target, t_uname, "ban",
+                ts() + ADMIN_WARN_AUTOBAN_SECONDS,
+                "автобан за 4/3 предупреждений",
+                msg.from_user.id, 1
+            )
             await msg.reply("⛔ Лимит 4/3 — выдан бан на 3 дня. Счётчик предупреждений сброшен.")
         return
 
-    if cmd in MUTE:
+    if cmd == "mcmute":
         # /mcmute @u 15m причина  OR reply: /mcmute 15m причина
         if msg.reply_to_message:
             dur_sec = parse_duration(parts[1]) if len(parts) >= 2 else None
@@ -921,7 +898,7 @@ async def mc_commands_router(msg: Message):
             reason = " ".join(parts[3:]).strip() or reason
 
         if dur_sec is None:
-            dur_sec = 365 * 24 * 60 * 60  # условно "навсегда"
+            dur_sec = 365 * 24 * 60 * 60
             until = None
             until_txt = "Навсегда"
         else:
@@ -933,7 +910,7 @@ async def mc_commands_router(msg: Message):
         await msg.reply(f"🔇 Мут до: <b>{until_txt}</b>\nПричина: <i>{reason}</i>")
         return
 
-    if cmd in BAN:
+    if cmd == "mcban":
         # /mcban @u 1d причина  OR reply: /mcban 1d причина
         if msg.reply_to_message:
             dur_sec = parse_duration(parts[1]) if len(parts) >= 2 else None
@@ -948,8 +925,7 @@ async def mc_commands_router(msg: Message):
         await msg.reply(f"⛔ Бан до: <b>{fmt_dt(until)}</b> {active_tag(until)}\nПричина: <i>{reason}</i>")
         return
 
-    if cmd in KICK:
-        # /mckick @u причина OR reply: /mckick причина
+    if cmd == "mckick":
         if msg.reply_to_message:
             reason = " ".join(parts[1:]).strip() or reason
         else:
@@ -957,42 +933,33 @@ async def mc_commands_router(msg: Message):
 
         await bot.ban_chat_member(msg.chat.id, target)
         await bot.unban_chat_member(msg.chat.id, target)
-        # kick как запись, но не активный
         mc_upsert(msg.chat.id, target, t_uname, "kick", ts(), reason, msg.from_user.id, 0)
         await msg.reply(f"👢 Кик выполнен.\nПричина: <i>{reason}</i>")
         return
 
-    if cmd in UNWARN:
+    if cmd == "mcunwarn":
         admin_warn_set(msg.chat.id, target, 0)
         mc_upsert(msg.chat.id, target, t_uname, "warn", ts(), "снято", msg.from_user.id, 0)
         await msg.reply("✅ Предупреждения сброшены.")
         return
 
-    if cmd in UNMUTE:
-        await bot.restrict_chat_member(msg.chat.id, target, permissions=ChatPermissions(can_send_messages=True))
+    if cmd == "mcunmute":
+        await bot.restrict_chat_member(msg.chat.id, target, permissions=FULL_PERMS)
         mc_upsert(msg.chat.id, target, t_uname, "mute", ts(), "снято", msg.from_user.id, 0)
         await msg.reply("✅ Мут снят.")
         return
 
-    if cmd in UNBAN:
+    if cmd == "mcunban":
         await bot.unban_chat_member(msg.chat.id, target)
         mc_upsert(msg.chat.id, target, t_uname, "ban", ts(), "снято", msg.from_user.id, 0)
         await msg.reply("✅ Бан снят.")
-        return
-
-    if cmd in UNLOCK:
-        await bot.unban_chat_member(msg.chat.id, target)
-        await bot.restrict_chat_member(msg.chat.id, target, permissions=ChatPermissions(can_send_messages=True))
-        mc_upsert(msg.chat.id, target, t_uname, "ban", ts(), "unlock", msg.from_user.id, 0)
-        mc_upsert(msg.chat.id, target, t_uname, "mute", ts(), "unlock", msg.from_user.id, 0)
-        await msg.reply("✅ Разблокировано (бан/мут сняты).")
         return
 
 
 # =========================
 # ГРУППА: АНТИ-РЕКЛАМА (НЕ ТРОГАЕТ КОМАНДЫ)
 # =========================
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & (F.text | F.caption))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), (F.text | F.caption))
 async def anti_ads(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
