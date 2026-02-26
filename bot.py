@@ -820,10 +820,10 @@ HELP_FORMS = {
     "mute":  'Форма: <code>/mcmute @user 15m причина</code> или ответом: <code>/mcmute 15m причина</code>',
     "ban":   'Форма: <code>/mcban @user 1d причина</code> или ответом: <code>/mcban 1d причина</code>',
     "kick":  'Форма: <code>/mckick @user причина</code> или ответом: <code>/mckick причина</code>',
-    "unwarn":"Форма: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>',
-    "unmute":"Форма: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>',
-    "unban": "Форма: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>',
-    "unlock":"Форма: <code>/mcunlock @user</code> или ответом: <code>/mcunlock</code>',
+    "unwarn":"Форма: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>",
+    "unmute":"Форма: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>",
+    "unban": "Форма: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>",
+    "unlock":"Форма: <code>/mcunlock @user</code> или ответом: <code>/mcunlock</code>",
 }
 
 def cmd_is_any(msg: Message, names: set[str]) -> bool:
