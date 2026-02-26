@@ -9,6 +9,17 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButtimport os
+import re
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from html import escape
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ChatPermissions,
 )
@@ -119,6 +130,34 @@ def fmt_left(seconds: int) -> str:
     m = (seconds % 3600) // 60
     return f"{h:02d}:{m:02d}"
 
+def parse_cmd_parts(msg: Message) -> list[str]:
+    return (msg.text or "").split()
+
+async def get_target_from_command(msg: Message) -> int | None:
+    # reply
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        return msg.reply_to_message.from_user.id
+
+    # @username / id
+    parts = parse_cmd_parts(msg)
+    if len(parts) >= 2:
+        p = parts[1].strip()
+        if p.isdigit():
+            return int(p)
+        if p.startswith("@"):
+            try:
+                ch = await bot.get_chat(p[1:])
+                return int(ch.id)
+            except Exception:
+                return None
+    return None
+
+async def get_target_name_username_from_reply(msg: Message) -> tuple[str | None, str | None]:
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        return u.full_name, u.username
+    return None, None
+
 
 # =========================
 # АНТИ-РЕКЛАМА (правила)
@@ -148,6 +187,7 @@ def is_ad_message(text: str | None) -> tuple[bool, str]:
 # =========================
 def db():
     con = sqlite3.connect(DB_PATH)
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS permits (
         chat_id INTEGER NOT NULL,
@@ -156,6 +196,7 @@ def db():
         last_ad_ts INTEGER DEFAULT 0,
         PRIMARY KEY(chat_id, user_id)
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS ad_strikes (
         chat_id INTEGER NOT NULL,
@@ -163,6 +204,7 @@ def db():
         stage INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(chat_id, user_id)
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS deleted_ads_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,12 +216,14 @@ def db():
         reason TEXT,
         created_ts INTEGER NOT NULL
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS known_chats (
         chat_id INTEGER PRIMARY KEY,
         title TEXT,
         updated_ts INTEGER NOT NULL
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS admin_warns (
         chat_id INTEGER NOT NULL,
@@ -187,11 +231,13 @@ def db():
         count INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY(chat_id, user_id)
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS support_threads (
         user_id INTEGER PRIMARY KEY,
         last_ts INTEGER NOT NULL DEFAULT 0
     )""")
+
     con.execute("""
     CREATE TABLE IF NOT EXISTS mc_punishments (
         chat_id INTEGER NOT NULL,
@@ -205,6 +251,7 @@ def db():
         active INTEGER NOT NULL DEFAULT 1,
         PRIMARY KEY(chat_id, user_id, kind)
     )""")
+
     con.commit()
     return con
 
@@ -218,14 +265,6 @@ def remember_chat(chat_id: int, title: str | None):
     )
     con.commit()
     con.close()
-
-def get_known_chats() -> list[tuple[int, str]]:
-    con = db()
-    rows = con.execute(
-        "SELECT chat_id, title FROM known_chats ORDER BY updated_ts DESC"
-    ).fetchall()
-    con.close()
-    return [(int(r[0]), str(r[1] or "")) for r in rows]
 
 
 # ----- разрешения -----
@@ -449,6 +488,12 @@ async def cmd_chatid(msg: Message):
 
 
 # =========================
+# HELP для /userid
+# =========================
+HELP_FORMS_USERID = "Форма: <code>/userid</code> — используй <u>ответом</u> на сообщение пользователя (админы)."
+
+
+# =========================
 # /userid (только админы, только reply)
 # =========================
 @dp.message(F.chat.type.in_({"group", "supergroup"}), Command("userid"))
@@ -457,9 +502,89 @@ async def cmd_userid(msg: Message):
     if not is_admin(msg.from_user.id):
         return
     if not msg.reply_to_message or not msg.reply_to_message.from_user:
-        return await msg.reply("ℹ️ Используй <b>/userid</b> <u>ответом</u> на сообщение пользователя.")
+        return await msg.reply(HELP_FORMS_USERID)
     u = msg.reply_to_message.from_user
     await msg.reply(f"🆔 {user_link(u.id, u.full_name)}: <code>{u.id}</code>")
+
+
+# =========================
+# /adgive /adremove (в чате, админы)
+# =========================
+HELP_ADGIVE = (
+    "✅ Выдать разрешение рекламы\n"
+    "Форма:\n"
+    "• ответом: <code>/adgive 1d</code> (срок опционально)\n"
+    "• или: <code>/adgive @user 1d</code>\n"
+    "Если срок не указать — навсегда."
+)
+HELP_ADREMOVE = (
+    "🗑️ Убрать разрешение рекламы\n"
+    "Форма:\n"
+    "• ответом: <code>/adremove</code>\n"
+    "• или: <code>/adremove @user</code>"
+)
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), Command("adgive"))
+async def cmd_adgive(msg: Message):
+    remember_chat(msg.chat.id, msg.chat.title)
+    if not is_admin(msg.from_user.id):
+        return
+
+    parts = parse_cmd_parts(msg)
+
+    # reply: /adgive 1d
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.full_name
+        dur_token = parts[1] if len(parts) >= 2 else None
+    else:
+        # /adgive @user 1d
+        if len(parts) < 2:
+            return await msg.reply(HELP_ADGIVE)
+        # target in parts[1]
+        # duration in parts[2] optional
+        dur_token = parts[2] if len(parts) >= 3 else None
+        # resolve target
+        target_id = await get_target_from_command(msg)
+        target_name, _ = await get_target_name_username_from_reply(msg)
+        if target_id is None:
+            return await msg.reply("❌ Не смог определить пользователя. Ответь на сообщение или укажи @user/ID.")
+
+    dur_sec = parse_duration(dur_token)
+    until_ts = None if dur_sec is None else ts() + dur_sec
+
+    permit_set(msg.chat.id, target_id, until_ts)
+
+    await msg.reply(
+        "✅ <b>Разрешение на рекламу выдано</b>\n"
+        f"Пользователь: {user_link(target_id, target_name or str(target_id))}\n"
+        f"⏳ До: <b>{fmt_dt(until_ts)}</b>"
+    )
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), Command("adremove"))
+async def cmd_adremove(msg: Message):
+    remember_chat(msg.chat.id, msg.chat.title)
+    if not is_admin(msg.from_user.id):
+        return
+
+    # reply or arg
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+        target_name = msg.reply_to_message.from_user.full_name
+    else:
+        parts = parse_cmd_parts(msg)
+        if len(parts) < 2:
+            return await msg.reply(HELP_ADREMOVE)
+        target_id = await get_target_from_command(msg)
+        target_name = None
+        if target_id is None:
+            return await msg.reply("❌ Не смог определить пользователя. Укажи @user/ID или ответь на сообщение.")
+
+    permit_remove(msg.chat.id, target_id)
+    await msg.reply(
+        "🗑️ <b>Разрешение на рекламу убрано</b>\n"
+        f"Пользователь: {user_link(target_id, target_name or str(target_id))}"
+    )
 
 
 # =========================
@@ -584,12 +709,17 @@ async def st_perm_give(msg: Message, state: FSMContext):
     dur_sec = parse_duration(raw_dur)
     until_ts = None if dur_sec is None else ts() + dur_sec
 
-    chats = get_known_chats()
+    # В ЛС выдаём на все известные чаты (как раньше)
+    con = db()
+    rows = con.execute("SELECT chat_id FROM known_chats").fetchall()
+    con.close()
+    chats = [int(r[0]) for r in rows]
+
     if not chats:
         await msg.answer("⚠️ Я ещё не знаю чаты. Напиши что-нибудь в группе с ботом и повтори.")
         return
 
-    for chat_id, _ in chats:
+    for chat_id in chats:
         permit_set(chat_id, uid, until_ts)
 
     await state.clear()
@@ -613,8 +743,12 @@ async def st_perm_remove(msg: Message, state: FSMContext):
         await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.")
         return
 
-    chats = get_known_chats()
-    for chat_id, _ in chats:
+    con = db()
+    rows = con.execute("SELECT chat_id FROM known_chats").fetchall()
+    con.close()
+    chats = [int(r[0]) for r in rows]
+
+    for chat_id in chats:
         permit_remove(chat_id, uid)
 
     await state.clear()
@@ -633,7 +767,12 @@ async def cb_bc_menu(cq: CallbackQuery, state: FSMContext):
     if not is_admin(cq.from_user.id):
         await cq.answer("Нет доступа", show_alert=True)
         return
-    chats = get_known_chats()
+
+    con = db()
+    rows = con.execute("SELECT chat_id, title FROM known_chats ORDER BY updated_ts DESC").fetchall()
+    con.close()
+    chats = [(int(r[0]), str(r[1] or "")) for r in rows]
+
     if not chats:
         await cq.message.edit_text("📣 Нет чатов в списке. Напиши что-нибудь в группе с ботом и вернись.")
         await cq.answer()
@@ -780,28 +919,6 @@ async def apply_ban(chat_id: int, user_id: int, seconds: int | None):
         until = now_utc() + timedelta(seconds=seconds)
     await bot.ban_chat_member(chat_id, user_id, until_date=until)
 
-async def get_target_from_command(msg: Message) -> int | None:
-    # reply
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        return msg.reply_to_message.from_user.id
-
-    # @username / id
-    parts = (msg.text or "").split()
-    if len(parts) >= 2:
-        p = parts[1].strip()
-        if p.isdigit():
-            return int(p)
-        if p.startswith("@"):
-            try:
-                ch = await bot.get_chat(p[1:])
-                return int(ch.id)
-            except Exception:
-                return None
-    return None
-
-def parse_cmd_parts(msg: Message) -> list[str]:
-    return (msg.text or "").split()
-
 
 # =========================
 # ГРУППА: /mclist
@@ -827,7 +944,7 @@ async def cmd_mclist(msg: Message):
             st = active_tag(until_ts) if int(active) == 1 else "[Неактивно]"
             u = f"@{uname}" if uname else str(uid)
             text += (
-                f"• <b>{u}</b> — <code>{kind}</code>\n"
+                f"• <b>{escape(u)}</b> — <code>{escape(kind)}</code>\n"
                 f"  ⏳ До: <b>{fmt_dt(until_ts)}</b> {st}\n"
                 f"  🧾 Причина: <i>{escape(reason or 'причина не указана')}</i>\n"
                 f"  🕒 Выдано: {fmt_dt(int(issued_ts))}\n\n"
@@ -842,7 +959,7 @@ async def cmd_mclist(msg: Message):
 
 
 # =========================
-# ГРУППА: ТОЛЬКО MC-КОМАНДЫ НАКАЗАНИЙ
+# ГРУППА: ТОЛЬКО MC-КОМАНДЫ НАКАЗАНИЙ (без /mcunlock)
 # =========================
 HELP_FORMS = {
     "mcwarn":   "Форма: <code>/mcwarn @user причина</code> или ответом: <code>/mcwarn причина</code>",
@@ -878,13 +995,9 @@ async def mc_commands_router(msg: Message):
     if target is None:
         return await msg.reply("❌ Не смог определить пользователя. Ответь на сообщение или укажи @user/ID.")
 
-    target_name = None
-    t_uname = None
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        target_name = msg.reply_to_message.from_user.full_name
-        t_uname = msg.reply_to_message.from_user.username
-
+    target_name, t_uname = await get_target_name_username_from_reply(msg)
     t_link = user_link(target, target_name or str(target))
+
     reason = "причина не указана"
     dur_sec = None
 
@@ -985,6 +1098,7 @@ async def mc_commands_router(msg: Message):
 async def anti_ads(msg: Message):
     remember_chat(msg.chat.id, msg.chat.title)
 
+    # команды не трогаем
     if is_command_text(msg.text) or is_command_text(msg.caption):
         return
 
@@ -1002,12 +1116,14 @@ async def anti_ads(msg: Message):
     uid = msg.from_user.id
     chat_title = msg.chat.title or ""
 
-    permit_ok, permit_until, last_ad_ts = permit_get(chat_id, uid)
+    u_link = user_link(uid, msg.from_user.full_name)
+
+    permit_ok, _permit_until, last_ad_ts = permit_get(chat_id, uid)
 
     # без разрешения, но пишет #реклама
     if (not permit_ok) and has_hashtag(text):
         await try_delete(msg)
-        await bot.send_message(chat_id, f"❌ У вас нет разрешения на рекламу.\nПолучить: {SUPPORT_BOT}")
+        await bot.send_message(chat_id, f"❌ {u_link}, у вас нет разрешения на рекламу.\nПолучить: {SUPPORT_BOT}")
         log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "нет разрешения, но есть #реклама")
         return
 
@@ -1016,8 +1132,8 @@ async def anti_ads(msg: Message):
         await try_delete(msg)
         await bot.send_message(
             chat_id,
-            "🗑️ Ваше сообщение удалено, по причине отсутствия тега на рекламу.\n"
-            f"Пожалуйста укажите тег <b>\"{HASHTAG}\"</b> в конце."
+            f"🗑️ {u_link}, сообщение удалено: нет тега в конце.\n"
+            f"Укажите тег <b>\"{HASHTAG}\"</b> в конце."
         )
         log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({raw_reason})")
         return
@@ -1027,7 +1143,11 @@ async def anti_ads(msg: Message):
         if last_ad_ts and (ts() - last_ad_ts) < ADS_COOLDOWN_SECONDS:
             left = ADS_COOLDOWN_SECONDS - (ts() - last_ad_ts)
             await try_delete(msg)
-            await bot.send_message(chat_id, f"⏳ Рекламу можно отправлять раз в <b>24 часа</b>.\nОсталось: <b>{fmt_left(left)}</b>")
+            await bot.send_message(
+                chat_id,
+                f"⏳ {u_link}, рекламу можно отправлять раз в <b>24 часа</b>.\n"
+                f"Осталось: <b>{fmt_left(left)}</b>"
+            )
             log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "лимит 24 часа")
             return
         permit_touch_last_ad(chat_id, uid)
@@ -1043,6 +1163,7 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "⚠️ <b>Предупреждение</b>\n"
+                f"Пользователь: {u_link}\n"
                 "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}"
@@ -1056,6 +1177,7 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "🔇 <b>Мут 3 часа</b>\n"
+                f"Пользователь: {u_link}\n"
                 "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}"
@@ -1069,12 +1191,14 @@ async def anti_ads(msg: Message):
             await bot.send_message(
                 chat_id,
                 "🔇 <b>Мут 12 часов</b>\n"
+                f"Пользователь: {u_link}\n"
                 "Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Разрешение: {SUPPORT_BOT}\n\n"
                 "✅ Счётчик нарушений сброшен."
             )
 
+        # в логах оставляем детальную причину
         log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({raw_reason})")
         return
 
