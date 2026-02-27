@@ -1,19 +1,18 @@
-# bot.py — Aiogram 3.x (проверено под 3.25.0)
-# Функции:
-# - Анти-реклама по ссылкам t.me / телефонам / ключевым словам
-# - Разрешение на рекламу (через ЛС-меню) + лимит 1 раз в 24ч
-# - Стадии без разрешения: 1) предупреждение 2) мут 3 часа 3) мут 12 часов и сброс
-# - Если с разрешением, но раньше 24ч: предупреждения 1/3, >3 — снятие разрешения + кнопка "выдать снова"
-# - /mclist список наказаний (кликабельные ники)
-# - Команды снятия: /mcunwarn /mcunmute /mcunban (в группе)
-# - /userid (в ЛС и в группе по reply/forward/свой)
-# - Подсказки "/" в ГРУППЕ: ПУСТО (как ты хотел). В ЛС — только нужные.
+# mc_ads_bot.py
+# Aiogram 3.25.0
+# - Анти-реклама (ссылки/телефон/ключевые слова)
+# - Исключение: YouTube ссылки НЕ считаются рекламой
+# - Ловит рекламу даже через РЕДАКТИРОВАНИЕ сообщения (edited_message)
+# - Ловит IP-адреса и адреса Minecraft серверов (play.example.com / mc.example.net:25565)
+# - Кнопки (callback_data) работают
+# - Подсказки "/" в группах убраны (set_my_commands пусто для групп)
+# - В ЛС есть меню с кнопками + админские кнопки
 
 import os
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple, List
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -34,16 +33,31 @@ from aiogram.fsm.context import FSMContext
 # =========================
 # НАСТРОЙКИ
 # =========================
-TOKEN = os.environ.get("TOKEN")
-if not TOKEN:
-    raise RuntimeError("TOKEN is not set. Add environment variable TOKEN")
 
-ADMIN_IDS = {8085895186}  # <-- твой Telegram ID
+def load_token() -> str:
+    tok = os.environ.get("TOKEN")
+    if tok:
+        return tok.strip()
+
+    # удобный fallback для Termux: положи токен в файл token.txt рядом со скриптом
+    try:
+        with open("token.txt", "r", encoding="utf-8") as f:
+            t = f.read().strip()
+            if t:
+                return t
+    except Exception:
+        pass
+
+    raise RuntimeError("TOKEN is not set. Set env TOKEN or create token.txt with token inside.")
+
+TOKEN = load_token()
+
+ADMIN_IDS = {8085895186}
 
 DB_PATH = "mc_bot.db"
 HASHTAG = "#реклама"
 
-# анти-реклама: стадии наказаний бота (без разрешения)
+# анти-реклама: стадии наказаний (без разрешения)
 MUTE_2_SECONDS = 3 * 60 * 60       # 3 часа
 MUTE_3_SECONDS = 12 * 60 * 60      # 12 часов
 
@@ -56,7 +70,7 @@ PERMIT_INACTIVE_SECONDS = 30 * 24 * 60 * 60  # 30 дней
 RULES_LINK = "https://leoned777.github.io/chats/"
 SUPPORT_BOT_FOR_PERMIT = "@minecrfat_bot"
 
-# Стикер (по желанию). Если None — не отправляется.
+# стикер (опционально)
 AD_WARN_STICKER_ID = None
 
 # /mclist — по 10 записей
@@ -72,10 +86,10 @@ def now_utc() -> datetime:
 def ts() -> int:
     return int(now_utc().timestamp())
 
-def fmt_dt(ts_int: Optional[int]) -> str:
+def fmt_dt(ts_int: int | None) -> str:
     if ts_int is None:
         return "Навсегда"
-    dt = datetime.fromtimestamp(int(ts_int), tz=timezone.utc).astimezone()
+    dt = datetime.fromtimestamp(ts_int, tz=timezone.utc).astimezone()
     return dt.strftime("%d.%m.%Y %H:%M")
 
 def fmt_duration_left(seconds_left: int) -> str:
@@ -95,17 +109,17 @@ def fmt_duration_left(seconds_left: int) -> str:
         parts.append(f"{s}с")
     return " ".join(parts)
 
-def active_tag(until_ts: Optional[int], active_flag: int = 1) -> str:
+def active_tag(until_ts: int | None, active_flag: int = 1) -> str:
     if active_flag == 0:
         return "[Неактивно]"
     if until_ts is None:
         return "[Активно]"
-    return "[Активно]" if int(until_ts) > ts() else "[Неактивно]"
+    return "[Активно]" if until_ts > ts() else "[Неактивно]"
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-def parse_duration(token: Optional[str]) -> Optional[int]:
+def parse_duration(token: str | None) -> int | None:
     # 15m / 2h / 3d / 1w / 1y
     if not token:
         return None
@@ -118,7 +132,7 @@ def parse_duration(token: Optional[str]) -> Optional[int]:
     mult = {"m": 60, "h": 3600, "d": 86400, "w": 604800, "y": 31536000}[unit]
     return n * mult
 
-def is_command_text(text: Optional[str]) -> bool:
+def is_command_text(text: str | None) -> bool:
     return bool(text) and text.strip().startswith("/")
 
 def hashtag_at_end(text: str) -> bool:
@@ -133,33 +147,120 @@ def mention_html(user_id: int, full_name: str) -> str:
 
 
 # =========================
-# АНТИ-РЕКЛАМА (правила)
+# АНТИ-РЕКЛАМА (детект)
 # =========================
-KW = ["продам", "куплю", "сдам", "прайс", "подпишитесь", "подписывайтесь"]
-TELEGRAM_LINK = re.compile(r"(https?://)?t\.me/[\w_]{3,}", re.I)
-# нормальный телефон: +7 999 111-22-33 и т.п.
-PHONE = re.compile(r"(\+?\d[\d\-\s]{8,}\d)")
 
-def is_ad_message(text: Optional[str]) -> Tuple[bool, str]:
+KW = ["продам", "куплю", "сдам", "прайс", "подпишитесь", "подписывайтесь"]
+
+URL_RE = re.compile(r"(https?://[^\s]+|www\.[^\s]+)", re.I)
+TME_RE = re.compile(r"(https?://)?t\.me/[\w_]{3,}", re.I)
+
+PHONE_RE = re.compile(r"(\+?\d[\d\-\s]{8,}\d)")
+
+# IPv4
+IPV4_RE = re.compile(r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b")
+
+# Домен (простая проверка) + опционально :порт
+DOMAIN_PORT_RE = re.compile(
+    r"\b([a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?)+)(?::(\d{2,5}))?\b",
+    re.I
+)
+
+# Minecraft server обычно домен или IP, иногда с портом.
+# Мы считаем рекламой ЛЮБОЙ IP или домен:порт (или домен с частыми MC поддоменами).
+MC_HINT_RE = re.compile(r"\b(play|mc|mine|server|srv)\.", re.I)
+
+YOUTUBE_HOSTS = {
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+    "youtu.be", "www.youtu.be",
+    "music.youtube.com",
+}
+
+def url_host(u: str) -> str | None:
+    try:
+        if u.lower().startswith("www."):
+            u = "http://" + u
+        p = urlparse(u)
+        host = (p.netloc or "").lower()
+        if not host and p.path:
+            # на случай кривых ссылок
+            return None
+        # убираем порт
+        host = host.split("@")[-1].split(":")[0]
+        return host or None
+    except Exception:
+        return None
+
+def is_youtube_url(text: str) -> bool:
+    for m in URL_RE.finditer(text or ""):
+        host = url_host(m.group(0))
+        if host and host in YOUTUBE_HOSTS:
+            return True
+    return False
+
+def contains_mc_address(text: str) -> bool:
+    t = (text or "").lower()
+
+    # IP адреса
+    if IPV4_RE.search(t):
+        return True
+
+    # домен (в т.ч. play., mc.) или домен:порт
+    # если есть :порт — считаем точно как адрес сервера/реклама
+    for m in DOMAIN_PORT_RE.finditer(t):
+        domain = m.group(1)
+        port = m.group(2)
+        if port:
+            return True
+        if MC_HINT_RE.search(domain):
+            return True
+
+    return False
+
+def is_ad_message(text: str | None) -> tuple[bool, str]:
     """
     Возвращает (True/False, причина)
-    @username НЕ считается рекламой (мы не ищем по @).
+    @username НЕ считаем рекламой.
+    Исключение: YouTube ссылки разрешаем (не реклама).
     """
-    t = (text or "").lower()
-    if TELEGRAM_LINK.search(t):
+    t = (text or "").strip()
+    low = t.lower()
+
+    # YouTube не считаем рекламой
+    if is_youtube_url(low):
+        # но если в тексте есть ещё t.me / ip / домен:порт — это уже реклама
+        if TME_RE.search(low) or IPV4_RE.search(low) or contains_mc_address(low):
+            return True, "ссылка/адрес (кроме YouTube)"
+        return False, "youtube"
+
+    # t.me
+    if TME_RE.search(low):
         return True, "ссылка t.me"
-    if PHONE.search(t):
+
+    # телефон
+    if PHONE_RE.search(low):
         return True, "номер телефона"
+
+    # ip/майнкрафт адрес
+    if contains_mc_address(low):
+        return True, "адрес сервера/IP"
+
+    # ключевые слова
     for w in KW:
-        if w in t:
+        if w in low:
             return True, f'ключевое слово: "{w}"'
+
+    # обычные ссылки (кроме YouTube)
+    if URL_RE.search(low):
+        return True, "ссылка"
+
     return False, ""
 
 
 # =========================
 # БАЗА ДАННЫХ
 # =========================
-def db() -> sqlite3.Connection:
+def db():
     con = sqlite3.connect(DB_PATH)
     con.execute("""
     CREATE TABLE IF NOT EXISTS permits (
@@ -230,7 +331,7 @@ def db() -> sqlite3.Connection:
 
 
 # ----- чаты -----
-def remember_chat(chat_id: int, title: Optional[str]):
+def remember_chat(chat_id: int, title: str | None):
     con = db()
     con.execute(
         "INSERT OR REPLACE INTO known_chats(chat_id, title, updated_ts) VALUES (?,?,?)",
@@ -239,7 +340,7 @@ def remember_chat(chat_id: int, title: Optional[str]):
     con.commit()
     con.close()
 
-def get_known_chats() -> List[Tuple[int, str]]:
+def get_known_chats() -> list[tuple[int, str]]:
     con = db()
     rows = con.execute("SELECT chat_id, title FROM known_chats ORDER BY updated_ts DESC").fetchall()
     con.close()
@@ -247,7 +348,7 @@ def get_known_chats() -> List[Tuple[int, str]]:
 
 
 # ----- разрешения -----
-def permit_get(chat_id: int, user_id: int) -> Tuple[bool, Optional[int], int]:
+def permit_get(chat_id: int, user_id: int) -> tuple[bool, int | None, int]:
     con = db()
     row = con.execute(
         "SELECT until_ts, last_ad_ts FROM permits WHERE chat_id=? AND user_id=?",
@@ -261,7 +362,7 @@ def permit_get(chat_id: int, user_id: int) -> Tuple[bool, Optional[int], int]:
         return False, int(until_ts), int(last_ad_ts or 0)
     return True, (int(until_ts) if until_ts is not None else None), int(last_ad_ts or 0)
 
-def permit_set(chat_id: int, user_id: int, until_ts: Optional[int]):
+def permit_set(chat_id: int, user_id: int, until_ts: int | None):
     con = db()
     con.execute(
         """
@@ -285,11 +386,7 @@ def permit_touch_last_ad(chat_id: int, user_id: int):
     con.commit()
     con.close()
 
-def permits_list_active(chat_id: int) -> List[Tuple[int, Optional[int], int]]:
-    """
-    Возвращает пользователей, у кого разрешение НЕ истекло:
-      (user_id, until_ts, last_ad_ts)
-    """
+def permits_list_active(chat_id: int) -> list[tuple[int, int | None, int]]:
     now = ts()
     con = db()
     rows = con.execute(
@@ -318,10 +415,7 @@ def ad_stage_get(chat_id: int, user_id: int) -> int:
 
 def ad_stage_set(chat_id: int, user_id: int, stage: int):
     con = db()
-    con.execute(
-        "INSERT OR REPLACE INTO ad_strikes(chat_id, user_id, stage) VALUES (?,?,?)",
-        (chat_id, user_id, stage)
-    )
+    con.execute("INSERT OR REPLACE INTO ad_strikes(chat_id, user_id, stage) VALUES (?,?,?)", (chat_id, user_id, stage))
     con.commit()
     con.close()
 
@@ -335,10 +429,7 @@ def cooldown_warn_get(chat_id: int, user_id: int) -> int:
 
 def cooldown_warn_set(chat_id: int, user_id: int, count: int):
     con = db()
-    con.execute(
-        "INSERT OR REPLACE INTO cooldown_strikes(chat_id, user_id, count) VALUES (?,?,?)",
-        (chat_id, user_id, count)
-    )
+    con.execute("INSERT OR REPLACE INTO cooldown_strikes(chat_id, user_id, count) VALUES (?,?,?)", (chat_id, user_id, count))
     con.commit()
     con.close()
 
@@ -347,8 +438,9 @@ def cooldown_warn_reset(chat_id: int, user_id: int):
 
 
 # ----- логи рекламы -----
-def log_deleted_ad(chat_id: int, chat_title: str, user_id: int, username: Optional[str], text: str, reason: str):
-    snip = (text or "").strip().replace("\n", " ")[:280]
+def log_deleted_ad(chat_id: int, chat_title: str, user_id: int, username: str | None, text: str, reason: str):
+    snip = (text or "").strip().replace("\n", " ")
+    snip = snip[:280]
     con = db()
     con.execute(
         "INSERT INTO deleted_ads_log(chat_id, chat_title, user_id, username, text_snip, reason, created_ts) VALUES (?,?,?,?,?,?,?)",
@@ -365,7 +457,7 @@ def support_touch_user(uid: int):
     con.commit()
     con.close()
 
-def support_users_list() -> List[int]:
+def support_users_list() -> list[int]:
     con = db()
     rows = con.execute("SELECT user_id FROM support_threads ORDER BY last_ts DESC").fetchall()
     con.close()
@@ -373,8 +465,7 @@ def support_users_list() -> List[int]:
 
 
 # ----- наказания (для /mclist) -----
-def mc_upsert(chat_id: int, user_id: int, username: Optional[str], kind: str,
-              until_ts: Optional[int], reason: str, issued_by: int, active: int):
+def mc_upsert(chat_id: int, user_id: int, username: str | None, kind: str, until_ts: int | None, reason: str, issued_by: int, active: int):
     con = db()
     con.execute(
         """
@@ -386,7 +477,7 @@ def mc_upsert(chat_id: int, user_id: int, username: Optional[str], kind: str,
     con.commit()
     con.close()
 
-def mc_list(chat_id: int, page: int) -> Tuple[List[tuple], int]:
+def mc_list(chat_id: int, page: int) -> tuple[list[tuple], int]:
     con = db()
     total = con.execute("SELECT COUNT(*) FROM mc_punishments WHERE chat_id=?", (chat_id,)).fetchone()[0]
     offset = (page - 1) * MC_LIST_PAGE_SIZE
@@ -405,6 +496,12 @@ def mc_list(chat_id: int, page: int) -> Tuple[List[tuple], int]:
 
 
 # ----- админ-варны (счётчик) -----
+def admin_warn_get(chat_id: int, user_id: int) -> int:
+    con = db()
+    row = con.execute("SELECT count FROM admin_warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)).fetchone()
+    con.close()
+    return int(row[0]) if row else 0
+
 def admin_warn_set(chat_id: int, user_id: int, count: int):
     con = db()
     con.execute("INSERT OR REPLACE INTO admin_warns(chat_id, user_id, count) VALUES (?,?,?)", (chat_id, user_id, count))
@@ -439,7 +536,9 @@ def kb_main(is_admin_flag: bool) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📣 Рассылка", callback_data="bc_menu")],
             [InlineKeyboardButton(text="💬 Сообщения", callback_data="support_admin")],
         ]
-    rows += [[InlineKeyboardButton(text="☎️ Связь с админом", callback_data="support_user")]]
+    rows += [
+        [InlineKeyboardButton(text="☎️ Связь с админом", callback_data="support_user")],
+    ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_back(to: str = "menu") -> InlineKeyboardMarkup:
@@ -455,7 +554,7 @@ def kb_perm() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")],
     ])
 
-def kb_bc_chats(chats: List[Tuple[int, str]]) -> InlineKeyboardMarkup:
+def kb_bc_chats(chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     rows = []
     for cid, title in chats[:25]:
         label = title if title else str(cid)
@@ -463,7 +562,7 @@ def kb_bc_chats(chats: List[Tuple[int, str]]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_support_admin_users(users: List[int]) -> InlineKeyboardMarkup:
+def kb_support_admin_users(users: list[int]) -> InlineKeyboardMarkup:
     rows = []
     for uid in users[:25]:
         rows.append([InlineKeyboardButton(text=f"👤 {uid}", callback_data=f"sup_user:{uid}")])
@@ -480,7 +579,7 @@ def kb_mclist(chat_id: int, page: int, total: int) -> InlineKeyboardMarkup:
     rows = [buttons] if buttons else []
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_perm_list_pick_chat(chats: List[Tuple[int, str]]) -> InlineKeyboardMarkup:
+def kb_perm_list_pick_chat(chats: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     rows = []
     for cid, title in chats[:25]:
         label = title if title else str(cid)
@@ -521,7 +620,7 @@ async def ensure_delete_warning(chat_id: int):
         "Дай мне права: <b>Delete messages</b> (сделай админом)."
     )
 
-async def notify_admins(text: str, kb: Optional[InlineKeyboardMarkup] = None):
+async def notify_admins(text: str, kb: InlineKeyboardMarkup | None = None):
     for aid in ADMIN_IDS:
         try:
             await bot.send_message(aid, text, reply_markup=kb)
@@ -532,7 +631,7 @@ async def notify_admins(text: str, kb: Optional[InlineKeyboardMarkup] = None):
 # =========================
 # ГРУППА: наказания (mute/ban)
 # =========================
-async def apply_mute(chat_id: int, user_id: int, seconds: Optional[int]):
+async def apply_mute(chat_id: int, user_id: int, seconds: int | None):
     if seconds is None:
         perms = ChatPermissions(can_send_messages=False)
         await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
@@ -551,7 +650,7 @@ async def apply_unmute(chat_id: int, user_id: int):
     )
     await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
 
-async def apply_ban(chat_id: int, user_id: int, seconds: Optional[int]):
+async def apply_ban(chat_id: int, user_id: int, seconds: int | None):
     until = None
     if seconds is not None:
         until = now_utc() + timedelta(seconds=seconds)
@@ -564,17 +663,13 @@ async def apply_unban(chat_id: int, user_id: int):
 # =========================
 # РАЗБОР ЦЕЛИ ДЛЯ КОМАНД
 # =========================
-def split_args(text: Optional[str]) -> List[str]:
-    if not text:
-        return []
-    parts = text.strip().split()
-    return parts[1:] if len(parts) > 1 else []
-
-async def resolve_target_from_command(msg: Message, args: List[str]) -> Optional[int]:
+async def resolve_target_from_command(msg: Message, args: list[str]) -> int | None:
     # 1) reply — если нет @/id в аргументах
-    if msg.reply_to_message and msg.reply_to_message.from_user and not args:
-        return msg.reply_to_message.from_user.id
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if not args:
+            return msg.reply_to_message.from_user.id
 
+    # 2) аргументы: id или @username
     if args:
         t = args[0].strip()
         if t.isdigit():
@@ -588,26 +683,11 @@ async def resolve_target_from_command(msg: Message, args: List[str]) -> Optional
                 return None
     return None
 
-async def resolve_user_id_from_input(msg: Message, raw: Optional[str]) -> Optional[int]:
-    # 1) forward (если не скрыт)
-    if msg.forward_from:
-        return msg.forward_from.id
-
-    # 2) id числом
-    if raw and raw.strip().isdigit():
-        return int(raw.strip())
-
-    # 3) @username -> get_chat
-    if raw:
-        t = raw.strip()
-        if t.startswith("@"):
-            t = t[1:]
-            try:
-                ch = await bot.get_chat(t)
-                return int(ch.id)
-            except Exception:
-                return None
-    return None
+def split_args(text: str | None) -> list[str]:
+    if not text:
+        return []
+    parts = text.strip().split()
+    return parts[1:] if len(parts) > 1 else []
 
 
 # =========================
@@ -634,7 +714,6 @@ async def cmd_cancel(msg: Message, state: FSMContext):
 
 @dp.message(Command("chatid"))
 async def cmd_chatid(msg: Message):
-    # команда есть, но в подсказках групп мы всё равно делаем пусто
     if msg.chat.type in ("group", "supergroup"):
         await msg.reply(f"✅ chat_id: <code>{msg.chat.id}</code>")
     else:
@@ -642,7 +721,6 @@ async def cmd_chatid(msg: Message):
 
 @dp.message(Command("userid"))
 async def cmd_userid(msg: Message):
-    # reply > forward > self
     if msg.reply_to_message and msg.reply_to_message.from_user:
         u = msg.reply_to_message.from_user
         await msg.reply(f"🆔 ID пользователя: <code>{u.id}</code>")
@@ -654,7 +732,7 @@ async def cmd_userid(msg: Message):
 
 
 # =========================
-# ГРУППА: /adgive /adrevoke (команды есть, но подсказок в группе нет)
+# ГРУППА: /adgive /adrevoke (нужные админские)
 # =========================
 @dp.message(Command("adgive"))
 async def cmd_adgive(msg: Message):
@@ -757,7 +835,7 @@ async def cmd_mcunban(msg: Message):
 
 
 # =========================
-# /mclist (оставили)
+# /mclist
 # =========================
 def kind_ru(kind: str) -> str:
     return {
@@ -767,15 +845,14 @@ def kind_ru(kind: str) -> str:
         "kick": "KICK",
     }.get(kind, kind.upper())
 
-def render_mclist(chat_id: int, page: int) -> Tuple[str, InlineKeyboardMarkup]:
+def render_mclist(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup]:
     rows, total = mc_list(chat_id, page)
     if not rows:
         return "📋 <b>Список наказаний пуст.</b>", InlineKeyboardMarkup(inline_keyboard=[])
 
     lines = [f"📋 <b>Список наказаний</b> (стр. {page})", ""]
     for (user_id, username, kind, until_ts, reason, issued_ts, active) in rows:
-        user_label = username or str(user_id)
-        user_link = f'<a href="tg://user?id={user_id}">{user_label}</a>'
+        user_link = f'<a href="tg://user?id={user_id}">{username or user_id}</a>'
         until_str = f"{fmt_dt(until_ts)} {active_tag(until_ts, active)}"
         reason = reason or "Причина не указана"
         lines.append(
@@ -825,7 +902,7 @@ async def cb_mclist(cq: CallbackQuery):
 
 
 # =========================
-# CALLBACK: меню (ЛС)
+# CALLBACK: меню (ЛС) — КНОПКИ
 # =========================
 @dp.callback_query(F.data == "menu")
 async def cb_menu(cq: CallbackQuery, state: FSMContext):
@@ -860,7 +937,7 @@ async def cb_profile(cq: CallbackQuery):
 
 
 # =========================
-# ЛС: Разрешения / Список разрешений / Рассылка / Support
+# ЛС: Разрешения / Список / Рассылка / Support
 # =========================
 @dp.callback_query(F.data == "perm_menu")
 async def cb_perm_menu(cq: CallbackQuery, state: FSMContext):
@@ -958,6 +1035,25 @@ async def cb_perm_remove(cq: CallbackQuery, state: FSMContext):
         reply_markup=kb_back("perm_menu")
     )
     await cq.answer()
+
+async def resolve_user_id_from_input(msg: Message, raw: str | None) -> int | None:
+    # 1) forward (если не скрыт)
+    if msg.forward_from:
+        return msg.forward_from.id
+    # 2) id числом
+    if raw and raw.strip().isdigit():
+        return int(raw.strip())
+    # 3) @username -> get_chat
+    if raw:
+        t = raw.strip()
+        if t.startswith("@"):
+            t = t[1:]
+            try:
+                ch = await bot.get_chat(t)
+                return int(ch.id)
+            except Exception:
+                return None
+    return None
 
 @dp.message(AdminStates.waiting_permit_give)
 async def st_perm_give(msg: Message, state: FSMContext):
@@ -1150,20 +1246,18 @@ async def st_sup_reply(msg: Message, state: FSMContext):
 async def private_catchall(msg: Message):
     # неизвестные команды в ЛС
     if msg.text and msg.text.startswith("/"):
-        allowed = {"/start", "/cancel", "/userid"}
-        if msg.text.split()[0] not in allowed:
+        allow = {"/start", "/cancel", "/chatid", "/userid"}
+        if msg.text.split()[0] not in allow:
             await msg.answer("ℹ️ Нажми /start чтобы открыть меню.")
-        return
+            return
 
-    # обычное сообщение -> в поддержку
     support_touch_user(msg.from_user.id)
-
     for aid in ADMIN_IDS:
         try:
             uname = f"@{msg.from_user.username}" if msg.from_user.username else ""
             await bot.send_message(
                 aid,
-                "📩 <b>Сообщение от пользователя</b>\n"
+                f"📩 <b>Сообщение от пользователя</b>\n"
                 f"🆔 <code>{msg.from_user.id}</code> {uname}\n\n"
                 f"{msg.text or ''}"
             )
@@ -1210,10 +1304,9 @@ async def cb_noop(cq: CallbackQuery):
 
 
 # =========================
-# ГРУППА: АНТИ-РЕКЛАМА
+# АНТИ-РЕКЛАМА: общая логика (для msg и edited_message)
 # =========================
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & (F.text | F.caption))
-async def anti_ads(msg: Message):
+async def handle_ad_check(msg: Message, edited: bool = False):
     remember_chat(msg.chat.id, msg.chat.title)
 
     # команды не трогаем
@@ -1236,6 +1329,7 @@ async def anti_ads(msg: Message):
     user_mention = mention_html(uid, msg.from_user.full_name)
 
     permit_ok, _permit_until, last_ad_ts = permit_get(chat_id, uid)
+    edit_tag = " (редактирование)" if edited else ""
 
     # (1) без разрешения, но пишет #реклама
     if (not permit_ok) and has_hashtag(text):
@@ -1243,8 +1337,8 @@ async def anti_ads(msg: Message):
         if not deleted:
             await ensure_delete_warning(chat_id)
 
-        await bot.send_message(chat_id, f"❌ У вас нет разрешения на рекламу.\nПолучить: {SUPPORT_BOT_FOR_PERMIT}")
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, "нет разрешения, но есть #реклама")
+        await bot.send_message(chat_id, f"❌ У вас нет разрешения на рекламу{edit_tag}.\nПолучить: {SUPPORT_BOT_FOR_PERMIT}")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"нет разрешения, но есть #реклама{edit_tag}")
         return
 
     # (2) есть разрешение, но реклама без тега в конце
@@ -1255,12 +1349,11 @@ async def anti_ads(msg: Message):
 
         await bot.send_message(
             chat_id,
-            f"{user_mention}, 🗑️ ваше сообщение удалено.\n"
+            f"{user_mention}, 🗑️ ваше сообщение удалено{edit_tag}.\n"
             f"Причина: <b>нет тега {HASHTAG} в конце</b>\n"
             f"Правила: {RULES_LINK}"
         )
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text,
-                       f"разрешение есть, но тег не в конце ({reason_detail})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"разрешение есть, но тег не в конце ({reason_detail}){edit_tag}")
         return
 
     # (3) есть разрешение и реклама — лимит 24ч
@@ -1276,15 +1369,13 @@ async def anti_ads(msg: Message):
 
             await bot.send_message(
                 chat_id,
-                f"⏳ {user_mention}, реклама раз в <b>24 часа</b>.\n"
+                f"⏳ {user_mention}, реклама раз в <b>24 часа</b>{edit_tag}.\n"
                 f"Осталось ждать: <b>{fmt_duration_left(left)}</b>\n"
                 f"⚠️ Вы получили предупреждение <b>{min(warn_count, 3)}/3</b>."
             )
 
-            log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text,
-                           f"лимит 24 часа (попытка {warn_count})")
+            log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"лимит 24 часа (попытка {warn_count}){edit_tag}")
 
-            # если больше 3 попыток => забираем разрешение
             if warn_count > 3:
                 permit_remove(chat_id, uid)
                 cooldown_warn_reset(chat_id, uid)
@@ -1293,15 +1384,11 @@ async def anti_ads(msg: Message):
                     f"🚫 <b>Разрешение снято</b>\n\n"
                     f"Пользователь: {user_mention}\n"
                     f"Причина: <b>нарушение правил пиара</b>\n"
-                    f"(слишком много попыток рекламы раньше 24 часов)"
+                    f"(слишком много попыток рекламы раньше 24 часов){edit_tag}"
                 )
 
                 kb = kb_regrant(chat_id, uid)
-
-                # в группу
                 await bot.send_message(chat_id, info, reply_markup=kb)
-
-                # админам в ЛС
                 await notify_admins("⚠️ " + info, kb)
 
             return
@@ -1330,7 +1417,7 @@ async def anti_ads(msg: Message):
 
             await bot.send_message(
                 chat_id,
-                f"{user_mention}, ваше сообщение удалено.\n"
+                f"{user_mention}, ваше сообщение удалено{edit_tag}.\n"
                 f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
@@ -1345,13 +1432,12 @@ async def anti_ads(msg: Message):
                 pass
             await bot.send_message(
                 chat_id,
-                f"🔇 {user_mention} — мут на <b>3 часа</b>.\n"
+                f"🔇 {user_mention} — мут на <b>3 часа</b>{edit_tag}.\n"
                 f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
                 f'В разделе "Связь с админом".'
             )
-
         else:
             ad_stage_set(chat_id, uid, 0)
             try:
@@ -1360,7 +1446,7 @@ async def anti_ads(msg: Message):
                 pass
             await bot.send_message(
                 chat_id,
-                f"🔇 {user_mention} — мут на <b>12 часов</b>.\n"
+                f"🔇 {user_mention} — мут на <b>12 часов</b>{edit_tag}.\n"
                 f"Причина: реклама\n"
                 f"Правила: {RULES_LINK}\n"
                 f"Получить разрешение можно в боте: {SUPPORT_BOT_FOR_PERMIT}\n"
@@ -1368,27 +1454,40 @@ async def anti_ads(msg: Message):
                 f"✅ Счётчик нарушений сброшен."
             )
 
-        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text,
-                       f"реклама без разрешения ({reason_detail})")
+        log_deleted_ad(chat_id, chat_title, uid, msg.from_user.username, text, f"реклама без разрешения ({reason_detail}){edit_tag}")
         return
 
 
 # =========================
+# ГРУППА: АНТИ-РЕКЛАМА (новые сообщения)
+# =========================
+@dp.message(F.chat.type.in_({"group", "supergroup"}) & (F.text | F.caption))
+async def anti_ads(msg: Message):
+    await handle_ad_check(msg, edited=False)
+
+# =========================
+# ГРУППА: АНТИ-РЕКЛАМА (редактирование)
+# =========================
+@dp.edited_message(F.chat.type.in_({"group", "supergroup"}) & (F.text | F.caption))
+async def anti_ads_edited(msg: Message):
+    await handle_ad_check(msg, edited=True)
+
+
+# =========================
 # Команды для подсказок "/"
-# В ГРУППЕ: ПУСТО
-# В ЛС: только нужное
 # =========================
 async def setup_commands():
     private_cmds = [
         BotCommand(command="start", description="Меню бота"),
         BotCommand(command="cancel", description="Отмена/выход в меню"),
         BotCommand(command="userid", description="Узнать ID (reply/forward/свой)"),
+        BotCommand(command="chatid", description="Показать chat_id (в группе)"),
     ]
 
     await bot.set_my_commands(private_cmds, scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands(private_cmds, scope=BotCommandScopeDefault())
 
-    # В группах подсказки пустые (как ты просил)
+    # убираем подсказки в группах
     await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
 
 
