@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery,
@@ -37,7 +38,8 @@ from aiogram.fsm.context import FSMContext
 # НАСТРОЙКИ
 # =========================
 
-TOKEN = "8563240122:AAHSDsS6eJOg-NbvUO-wwmu2TQypI8wLz80"
+# ВСТАВЬ СВОЙ ТОКЕН СЮДА:
+TOKEN = "PASTE_YOUR_TOKEN_HERE"
 
 ADMIN_IDS = {8085895186}
 
@@ -170,9 +172,7 @@ def url_host(u: str) -> str | None:
         p = urlparse(u)
         host = (p.netloc or "").lower()
         if not host and p.path:
-            # на случай кривых ссылок
             return None
-        # убираем порт
         host = host.split("@")[-1].split(":")[0]
         return host or None
     except Exception:
@@ -188,12 +188,9 @@ def is_youtube_url(text: str) -> bool:
 def contains_mc_address(text: str) -> bool:
     t = (text or "").lower()
 
-    # IP адреса
     if IPV4_RE.search(t):
         return True
 
-    # домен (в т.ч. play., mc.) или домен:порт
-    # если есть :порт — считаем точно как адрес сервера/реклама
     for m in DOMAIN_PORT_RE.finditer(t):
         domain = m.group(1)
         port = m.group(2)
@@ -213,31 +210,24 @@ def is_ad_message(text: str | None) -> tuple[bool, str]:
     t = (text or "").strip()
     low = t.lower()
 
-    # YouTube не считаем рекламой
     if is_youtube_url(low):
-        # но если в тексте есть ещё t.me / ip / домен:порт — это уже реклама
         if TME_RE.search(low) or IPV4_RE.search(low) or contains_mc_address(low):
             return True, "ссылка/адрес (кроме YouTube)"
         return False, "youtube"
 
-    # t.me
     if TME_RE.search(low):
         return True, "ссылка t.me"
 
-    # телефон
     if PHONE_RE.search(low):
         return True, "номер телефона"
 
-    # ip/майнкрафт адрес
     if contains_mc_address(low):
         return True, "адрес сервера/IP"
 
-    # ключевые слова
     for w in KW:
         if w in low:
             return True, f'ключевое слово: "{w}"'
 
-    # обычные ссылки (кроме YouTube)
     if URL_RE.search(low):
         return True, "ссылка"
 
@@ -586,7 +576,7 @@ def kb_regrant(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
 # =========================
 # БОТ
 # =========================
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 
@@ -628,12 +618,13 @@ async def apply_mute(chat_id: int, user_id: int, seconds: int | None):
     await bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until)
 
 async def apply_unmute(chat_id: int, user_id: int):
-    perms = ChatPermissions(
-        can_send_messages=True, can_send_audios=True, can_send_documents=True,
-        can_send_photos=True, can_send_videos=True, can_send_video_notes=True,
-        can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True,
-        can_add_web_page_previews=True, can_invite_users=True,
-        can_change_info=False, can_pin_messages=False
+    # Возвращаем права чата (самый правильный способ)
+    chat = await bot.get_chat(chat_id)
+    perms = chat.permissions or ChatPermissions(
+        can_send_messages=True,
+        can_send_other_messages=True,
+        can_send_polls=True,
+        can_add_web_page_previews=True
     )
     await bot.restrict_chat_member(chat_id, user_id, permissions=perms)
 
@@ -651,12 +642,15 @@ async def apply_unban(chat_id: int, user_id: int):
 # РАЗБОР ЦЕЛИ ДЛЯ КОМАНД
 # =========================
 async def resolve_target_from_command(msg: Message, args: list[str]) -> int | None:
-    # 1) reply — если нет @/id в аргументах
-    if msg.reply_to_message and msg.reply_to_message.from_user:
-        if not args:
-            return msg.reply_to_message.from_user.id
+    # 1) reply — самый надёжный вариант
+    if msg.reply_to_message and msg.reply_to_message.from_user and not args:
+        return msg.reply_to_message.from_user.id
 
-    # 2) аргументы: id или @username
+    # 2) forward (если reply на пересланное)
+    if msg.reply_to_message and msg.reply_to_message.forward_from and not args:
+        return msg.reply_to_message.forward_from.id
+
+    # 3) аргументы: id или @username
     if args:
         t = args[0].strip()
         if t.isdigit():
@@ -731,7 +725,8 @@ async def cmd_adgive(msg: Message):
     args = split_args(msg.text)
     uid = await resolve_target_from_command(msg, args)
     if uid is None:
-        await msg.reply("ℹ️ Формат: <code>/adgive @user 1d</code> или ответом: <code>/adgive 1d</code>")
+        await msg.reply("ℹ️ Формат: <code>/adgive @user 1d</code> или ответом: <code>/adgive 1d</code>\n"
+                        "⚠️ Если @username не находится — используй reply/forward или числовой ID.")
         return
 
     rest = args[1:] if args and (args[0].startswith("@") or args[0].isdigit()) else args
@@ -752,7 +747,8 @@ async def cmd_adrevoke(msg: Message):
     args = split_args(msg.text)
     uid = await resolve_target_from_command(msg, args)
     if uid is None:
-        await msg.reply("ℹ️ Формат: <code>/adrevoke @user</code> или ответом: <code>/adrevoke</code>")
+        await msg.reply("ℹ️ Формат: <code>/adrevoke @user</code> или ответом: <code>/adrevoke</code>\n"
+                        "⚠️ Если @username не находится — используй reply/forward или числовой ID.")
         return
 
     permit_remove(msg.chat.id, uid)
@@ -773,7 +769,8 @@ async def cmd_mcunwarn(msg: Message):
     args = split_args(msg.text)
     uid = await resolve_target_from_command(msg, args)
     if uid is None:
-        await msg.reply("ℹ️ Формат: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>")
+        await msg.reply("ℹ️ Формат: <code>/mcunwarn @user</code> или ответом: <code>/mcunwarn</code>\n"
+                        "⚠️ Если @username не находится — используй reply/forward или числовой ID.")
         return
 
     admin_warn_set(msg.chat.id, uid, 0)
@@ -790,7 +787,8 @@ async def cmd_mcunmute(msg: Message):
     args = split_args(msg.text)
     uid = await resolve_target_from_command(msg, args)
     if uid is None:
-        await msg.reply("ℹ️ Формат: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>")
+        await msg.reply("ℹ️ Формат: <code>/mcunmute @user</code> или ответом: <code>/mcunmute</code>\n"
+                        "⚠️ Если @username не находится — используй reply/forward или числовой ID.")
         return
 
     try:
@@ -810,7 +808,8 @@ async def cmd_mcunban(msg: Message):
     args = split_args(msg.text)
     uid = await resolve_target_from_command(msg, args)
     if uid is None:
-        await msg.reply("ℹ️ Формат: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>")
+        await msg.reply("ℹ️ Формат: <code>/mcunban @user</code> или ответом: <code>/mcunban</code>\n"
+                        "⚠️ Если @username не находится — используй reply/forward или числовой ID.")
         return
 
     try:
@@ -1005,7 +1004,8 @@ async def cb_perm_give(cq: CallbackQuery, state: FSMContext):
         "➕ <b>Выдать разрешение</b>\n\n"
         "Пришли: <code>@username</code> / <code>ID</code> / пересланное сообщение.\n"
         "Срок можно добавить: <code>@user 1d</code>\n"
-        "Если срок не указать — навсегда.",
+        "Если срок не указать — навсегда.\n\n"
+        "⚠️ Если @username не находится — пришли ID или пересланное сообщение.",
         reply_markup=kb_back("perm_menu")
     )
     await cq.answer()
@@ -1018,19 +1018,19 @@ async def cb_perm_remove(cq: CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_permit_remove)
     await cq.message.edit_text(
         "➖ <b>Забрать разрешение</b>\n\n"
-        "Пришли: <code>@username</code> / <code>ID</code> / пересланное сообщение.",
+        "Пришли: <code>@username</code> / <code>ID</code> / пересланное сообщение.\n\n"
+        "⚠️ Если @username не находится — пришли ID или пересланное сообщение.",
         reply_markup=kb_back("perm_menu")
     )
     await cq.answer()
 
 async def resolve_user_id_from_input(msg: Message, raw: str | None) -> int | None:
-    # 1) forward (если не скрыт)
     if msg.forward_from:
         return msg.forward_from.id
-    # 2) id числом
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        return msg.reply_to_message.from_user.id
     if raw and raw.strip().isdigit():
         return int(raw.strip())
-    # 3) @username -> get_chat
     if raw:
         t = raw.strip()
         if t.startswith("@"):
@@ -1053,7 +1053,8 @@ async def st_perm_give(msg: Message, state: FSMContext):
 
     uid = await resolve_user_id_from_input(msg, raw_target)
     if uid is None:
-        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.")
+        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.\n"
+                         "⚠️ Если @username не находится — пришли ID или пересланное сообщение.")
         return
 
     dur_sec = parse_duration(raw_dur)
@@ -1086,7 +1087,8 @@ async def st_perm_remove(msg: Message, state: FSMContext):
 
     uid = await resolve_user_id_from_input(msg, raw_target)
     if uid is None:
-        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.")
+        await msg.answer("❌ Не смог определить ID. Пришли ID / @username / пересланное сообщение.\n"
+                         "⚠️ Если @username не находится — пришли ID или пересланное сообщение.")
         return
 
     chats = get_known_chats()
@@ -1231,7 +1233,6 @@ async def st_sup_reply(msg: Message, state: FSMContext):
 # =========================
 @dp.message(F.chat.type == "private")
 async def private_catchall(msg: Message):
-    # неизвестные команды в ЛС
     if msg.text and msg.text.startswith("/"):
         allow = {"/start", "/cancel", "/chatid", "/userid"}
         if msg.text.split()[0] not in allow:
@@ -1274,7 +1275,7 @@ async def cb_regrant(cq: CallbackQuery):
     cooldown_warn_reset(chat_id, user_id)
 
     try:
-        await cq.message.edit_text(cq.message.html_text + "\n\n✅ <b>Разрешение снова выдано.</b>")
+        await cq.message.edit_text((cq.message.html_text or "") + "\n\n✅ <b>Разрешение снова выдано.</b>")
     except Exception:
         pass
 
@@ -1296,7 +1297,9 @@ async def cb_noop(cq: CallbackQuery):
 async def handle_ad_check(msg: Message, edited: bool = False):
     remember_chat(msg.chat.id, msg.chat.title)
 
-    # команды не трогаем
+    if not msg.from_user:
+        return
+
     if is_command_text(msg.text) or is_command_text(msg.caption):
         return
 
@@ -1306,7 +1309,6 @@ async def handle_ad_check(msg: Message, edited: bool = False):
 
     ad, reason_detail = is_ad_message(text)
 
-    # если не реклама и нет хэштега — игнор
     if (not ad) and (not has_hashtag(text)):
         return
 
@@ -1380,7 +1382,6 @@ async def handle_ad_check(msg: Message, edited: bool = False):
 
             return
 
-        # можно отправлять — засчитываем использование рекламы
         permit_touch_last_ad(chat_id, uid)
         cooldown_warn_reset(chat_id, uid)
         return
