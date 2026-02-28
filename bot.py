@@ -37,22 +37,6 @@ from aiogram.fsm.context import FSMContext
 # НАСТРОЙКИ
 # =========================
 
-def load_token() -> str:
-    tok = os.environ.get("TOKEN")
-    if tok:
-        return tok.strip()
-
-    # удобный fallback для Termux: положи токен в файл token.txt рядом со скриптом
-    try:
-        with open("token.txt", "r", encoding="utf-8") as f:
-            t = f.read().strip()
-            if t:
-                return t
-    except Exception:
-        pass
-
-    raise RuntimeError("TOKEN is not set. Set env TOKEN or create token.txt with token inside.")
-
 TOKEN = "8563240122:AAHSDsS6eJOg-NbvUO-wwmu2TQypI8wLz80"
 
 ADMIN_IDS = {8085895186}
