@@ -53,7 +53,7 @@ def load_token() -> str:
 
     raise RuntimeError("TOKEN is not set. Set env TOKEN or create token.txt with token inside.")
 
-TOKEN = load_token()
+TOKEN = "8563240122:AAHSDsS6eJOg-NbvUO-wwmu2TQypI8wLz80"
 
 ADMIN_IDS = {8085895186}
 
