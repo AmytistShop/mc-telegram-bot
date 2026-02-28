@@ -39,7 +39,7 @@ from aiogram.fsm.context import FSMContext
 # =========================
 
 # ВСТАВЬ СВОЙ ТОКЕН СЮДА:
-TOKEN = "PASTE_YOUR_TOKEN_HERE"
+TOKEN = "8563240122:AAHSDsS6eJOg-NbvUO-wwmu2TQypI8wLz80"
 
 ADMIN_IDS = {8085895186}
 
